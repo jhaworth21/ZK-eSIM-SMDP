@@ -180,7 +180,7 @@ def setupMNOValues(ss):
     ss.mnoid = mnoid
 
     #* Hashes the pid value to generate the H_pid value
-    digest = hashes.Hash(hashes.SHA384())
+    digest = hashes.Hash(hashes.SHA256())
     digest.update(pid)
     h_pid = digest.finalize()
     ss.h_pid = h_pid
@@ -197,7 +197,7 @@ def setupMNOValues(ss):
     ss.L_auth = L_auth
     root_auth = hash_fn(L_auth)    
     ss.root_auth = root_auth
-    ss.sig_root = sk_mno.sign(root_auth, ec.ECDSA(hashes.SHA384()))
+    ss.sig_root = sk_mno.sign(root_auth, ec.ECDSA(hashes.SHA256()))
     #* Spent token accumulator
     L_spent = rsp.MerkleAccumulator()
     ss.L_spent = L_spent
@@ -208,20 +208,20 @@ def setupMNOValues(ss):
     ss.pi_inc = pi_inc
 
     sig_cred = bytes(h_pid + h_cert + mnoid)
-    ss.sig_cred = sk_mno.sign(sig_cred, ec.ECDSA(hashes.SHA384()))
+    ss.sig_cred = sk_mno.sign(sig_cred, ec.ECDSA(hashes.SHA256()))
 
     #* Authorisation token generation 
     now = datetime.datetime.now()
     expiry = datetime.datetime(now.year, now.month+1, now.day).ctime().encode("utf-8")
     ss.expiry = expiry
     tok_data = h_pid + h_cert + mnoid + expiry
-    auth_tok = sk_mno.sign(data=tok_data, signature_algorithm=ec.ECDSA(hashes.SHA384()))
+    auth_tok = sk_mno.sign(data=tok_data, signature_algorithm=ec.ECDSA(hashes.SHA256()))
     ss.auth_tok = auth_tok
 
     return ss
 
 def hash_fn(input):
-    digest = hashes.Hash(hashes.SHA384())
+    digest = hashes.Hash(hashes.SHA256())
     digest.update(input)
     return digest.finalize()
 
@@ -680,7 +680,7 @@ class SmDppHttpServer:
         ss.eum_cert = eum_cert 
 
         #* creates the h_cert (ie H''(PCert_U)) - overwrites the default defined value from SetupMNO
-        digest = hashes.Hash(hashes.SHA384())
+        digest = hashes.Hash(hashes.SHA256())
         digest.update(euiccCertificate_bin)
         h_cert = digest.finalize()
         ss.setHCert(h_cert)
@@ -759,7 +759,7 @@ class SmDppHttpServer:
         #TODO - 
 
     
-        elig_bundle_signed_msg:str = euiccSigned1['signedMessage']
+        elig_bundle_signed_msg = euiccSigned1['signedMessage']
         pk_u = euicc_cert.public_key()
 
         elig_bundle_signed_msg_data = (
@@ -771,20 +771,25 @@ class SmDppHttpServer:
             euiccCertificate_bin
         )
         #* Verify Sig.verify_pk_U over (I_t, N_s, N_u, T_i, H_pid, PCert_U, sid)
-        if isinstance(pk_u, ec.EllipticCurvePublicKey):
-            if not pk_u.verify(elig_bundle_signed_msg.encode("utf-8"), elig_bundle_signed_msg_data, ec.ECDSA(hashes.SHA384())):
-                raise ApiError('0.1', '1.1', 'Failed to verify signed eligibility bundle')
-        else:
+        # Checks if the key is a valid type for verification
+        if not isinstance(pk_u, ec.EllipticCurvePublicKey):
             raise ApiError('0.1', '2.1', 'User Public Key not of Compatible Type')
+        try:
+            # Tries to perform the verification on the msg bytes and the data
+            pk_u.verify(elig_bundle_signed_msg, elig_bundle_signed_msg_data, ec.ECDSA(hashes.SHA256()))
+        except InvalidSignature:
+            raise ApiError('0.1', '1.1', 'Failed to verify signed eligibility bundle')
+
+
 
         root_sig_msg = ss.auth_root + ss.sig_root
         t_i_message_data = ss.h_pid + h_cert + ss.mnoid + ss.expiry
         now = datetime.datetime.now()
         if isinstance(ss.pk_mno, ec.EllipticCurvePublicKey):
             #* Verify Sig.verify_pk_MNO over (root_auth, sig^MNO_root)
-            if not ss.pk_mno.verify(ss.sig_cred, root_sig_msg, ec.ECDSA(hashes.SHA384())):
+            if not ss.pk_mno.verify(ss.sig_cred, root_sig_msg, ec.ECDSA(hashes.SHA256())):
                 raise ApiError('0.1', '1.2', 'Failed to verify MNO root signed message')
-            if not ss.pk_mno.verify(ss.t_i, t_i_message_data, ec.ECDSA(hashes.SHA384())):
+            if not ss.pk_mno.verify(ss.t_i, t_i_message_data, ec.ECDSA(hashes.SHA256())):
                 raise ApiError('0.1', '1.4', 'Failed to verify Authorisation Token T_i as signed by MNO PK')
             if now < datetime.datetime(now.year, now.month+1, now.day):
                 raise ApiError('0.1', '1.5', 'Token Expiry date is outdate (ie now < expiry)')
@@ -801,7 +806,7 @@ class SmDppHttpServer:
         #* Adds the token to the spent list if it hasn't already been added
         if isinstance(ss.L_spent, rsp.MerkleAccumulator):
             ss.L_spent = ss.L_spent.add(str(ss.t_i))
-        
+         
 
         # Put together profileMetadata + _bin
         ss.profileMetadata = ProfileMetadata(iccid_bin=h2b(swap_nibbles(iccid_str)), spn="OsmocomSPN", profile_name=matchingId)
@@ -1007,7 +1012,7 @@ class SmDppHttpServer:
         uePk = ec.EllipticCurvePublicKey.from_encoded_point(ec._CURVE_TYPES["SECP256K1"], pkU)
         data_bytes = json.dumps(dat).encode("utf-8")
         try:
-            uePk.verify(signature=sig, data=data_bytes, signature_algorithm=ec.ECDSA(hashes.SHA384()))
+            uePk.verify(signature=sig, data=data_bytes, signature_algorithm=ec.ECDSA(hashes.SHA256()))
         except InvalidSignature:
             return False
         return True
