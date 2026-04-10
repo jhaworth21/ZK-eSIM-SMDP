@@ -186,7 +186,7 @@ def setupMNOValues(ss):
     ss.h_pid = h_pid
 
     #* Sets up the keys needed for the MNO 
-    sk_mno = ec.generate_private_key(ec._CURVE_TYPES["SECP256K1"])
+    sk_mno = ec.generate_private_key(ec.SECP256K1())
     pk_mno = sk_mno.public_key()
     ss.pk_mno = pk_mno
 
@@ -1009,7 +1009,7 @@ class SmDppHttpServer:
         # ----------- ZK-ESIM based functions for protocol functionality -----------
     
     def validateEligibilityBundle(self, pkU: bytes, sig: bytes, dat: dict) -> bool:
-        uePk = ec.EllipticCurvePublicKey.from_encoded_point(ec._CURVE_TYPES["SECP256K1"], pkU)
+        uePk = ec.EllipticCurvePublicKey.from_encoded_point(ec.SECP256K1(), pkU)
         data_bytes = json.dumps(dat).encode("utf-8")
         try:
             uePk.verify(signature=sig, data=data_bytes, signature_algorithm=ec.ECDSA(hashes.SHA256()))
