@@ -209,7 +209,7 @@ def extract_euiccSigned2(prepareDownloadResponse: bytes) -> bytes:
     return tlv2
 
 def hash_fn(input):
-    digest = hashes.Hash(hashes.SHA384())
+    digest = hashes.Hash(hashes.SHA256())
     digest.update(input)
     return digest.finalize()
 

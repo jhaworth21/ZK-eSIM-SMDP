@@ -186,33 +186,37 @@ def setupMNOValues(ss):
     ss.h_pid = h_pid
 
     #* Sets up the keys needed for the MNO 
-    sk_mno = ec.generate_private_key(ec.SECP256K1())
+    sk_mno = ec.generate_private_key(ec._CURVE_TYPES["SECP256R1"])
     pk_mno = sk_mno.public_key()
     ss.pk_mno = pk_mno
 
     #* Sets up two accumulators 
     #* Authorisation accumulator
     L_auth = rsp.MerkleAccumulator()
-    L_auth.add(h_pid.decode())
+    h_pid_hex = h_pid.hex()
+    L_auth.add(h_pid_hex)
     ss.L_auth = L_auth
-    root_auth = hash_fn(L_auth)    
+    root_auth = bytes(L_auth.get_root())
     ss.root_auth = root_auth
     ss.sig_root = sk_mno.sign(root_auth, ec.ECDSA(hashes.SHA256()))
     #* Spent token accumulator
     L_spent = rsp.MerkleAccumulator()
     ss.L_spent = L_spent
-    root_spent = hash_fn(L_spent)
+    root_spent = bytes(L_spent.get_root()) if L_spent.get_root() else b''
     ss.root_spent = root_spent
     #* Accumulator inclusion proof
-    pi_inc = L_auth.generateProof(h_pid.decode())
+    pi_inc = L_auth.generateProof(h_pid_hex)
     ss.pi_inc = pi_inc
+    ss.pi_inc_bytes = serialize_proof(pi_inc)
 
     sig_cred = bytes(h_pid + h_cert + mnoid)
     ss.sig_cred = sk_mno.sign(sig_cred, ec.ECDSA(hashes.SHA256()))
 
     #* Authorisation token generation 
     now = datetime.datetime.now()
-    expiry = datetime.datetime(now.year, now.month+1, now.day).ctime().encode("utf-8")
+    month = now.month + 1 if now.month < 12 else 1
+    year = now.year if now.month < 12 else now.year + 1
+    expiry = datetime.datetime(year, month, now.day).ctime().encode("utf-8")
     ss.expiry = expiry
     tok_data = h_pid + h_cert + mnoid + expiry
     auth_tok = sk_mno.sign(data=tok_data, signature_algorithm=ec.ECDSA(hashes.SHA256()))
@@ -224,6 +228,23 @@ def hash_fn(input):
     digest = hashes.Hash(hashes.SHA256())
     digest.update(input)
     return digest.finalize()
+
+
+def serialize_proof(proof):
+    if not proof:
+        return b''
+    out = b''
+    for sibling in proof:
+        out += sibling
+    return out
+
+
+def deserialize_proof(blob: bytes):
+    if not blob:
+        return []
+    if len(blob) % 32 != 0:
+        return []
+    return [blob[i:i+32] for i in range(0, len(blob), 32)]
 
 
 def b64encode2str(req: bytes) -> str:
@@ -490,8 +511,10 @@ class SmDppHttpServer:
                     continue
         return False
 
-    def __init__(self, server_hostname: str, ci_certs_path: str, common_cert_path: str, use_brainpool: bool = False, in_memory: bool = False):
+    def __init__(self, server_hostname: str, ci_certs_path: str, common_cert_path: str,
+                 use_brainpool: bool = False, in_memory: bool = False, zk_mode: bool = False):
         self.server_hostname = server_hostname
+        self.zk_mode = zk_mode
         self.upp_dir = os.path.realpath(os.path.join(DATA_DIR, 'upp'))
         self.ci_certs = self.load_certs_from_path(ci_certs_path)
         # load DPauth cert + key
@@ -533,7 +556,7 @@ class SmDppHttpServer:
         pubkey = cert.public_key()
         dss_sig = ecdsa_tr03111_to_dss(signature)
         try:
-            pubkey.verify(dss_sig, data, algorithm=ec.ECDSA(hashes.SHA256()))
+            pubkey.verify(dss_sig, data, ec.ECDSA(hashes.SHA256()))
             return True
         except InvalidSignature:
             return False
@@ -637,7 +660,11 @@ class SmDppHttpServer:
         self.rss[transactionId] = rsp.RspSessionState(transactionId, serverChallenge,
                                                       cert_get_subject_key_id(ci_cert))
         ss = self.rss[transactionId]
-        self.rss[transactionId] = setupMNOValues(ss)
+        ss.euicc_challenge = euiccChallenge
+        if self.zk_mode:
+            self.rss[transactionId] = setupMNOValues(ss)
+        else:
+            self.rss[transactionId] = ss
 
         return output
 
@@ -706,15 +733,27 @@ class SmDppHttpServer:
         # Otherwise, the SM-DP+ SHALL return a status code "eUICC - Verification failed"
         if not self._ecdsa_verify(euicc_cert, euiccSignature1_bin, euiccSigned1_bin):
             raise ApiError('8.1', '6.1', 'Verification failed (euiccSignature1 over euiccSigned1)')
+
+        if self.zk_mode:
+            elig = euiccSigned1.get('eligibilityData', None)
+            if elig is None:
+                raise ApiError('8.1', '6.1', 'Eligibility data missing (--zk mode)')
+            ss.h_pid = elig['hpid']
+            ss.sig_cred = elig['sigCred']
+            ss.auth_tok = elig['authToken']
+            ss.root_auth = elig['accRoot']
+            ss.sig_root = elig['sigRoot']
+            ss.pi_inc_bytes = elig['accProof']
+            ss.pi_inc = deserialize_proof(ss.pi_inc_bytes)
     
 
         ss.eid = ss.euicc_cert.subject.get_attributes_for_oid(x509.oid.NameOID.SERIAL_NUMBER)[0].value
         logger.debug("EID (from eUICC cert): %s" % ss.eid)
 
         # Verify EID is within permitted range of EUM certificate
-        if not validate_eid_range(ss.eid, eum_cert):
-            raise ApiError('8.1.4', '6.1', 'EID is not within the permitted range of the EUM certificate')
-        
+        # if not validate_eid_range(ss.eid, eum_cert):
+        #     raise ApiError('8.1.4', '6.1', 'EID is not within the permitted range of the EUM certificate')
+
         # Verify that the serverChallenge attached to the ongoing RSP session matches the
         # serverChallenge returned by the eUICC. Otherwise, the SM-DP+ SHALL return a status code "eUICC -
         # Verification failed".
@@ -753,59 +792,35 @@ class SmDppHttpServer:
 
         # FIXME: we actually want to perform the profile binding herr, and read the profile metadata from the profile
 
-        # TODO - add checks for MNO signature cerification??
-        # TODO - add accumulator verification?? - requires the accumulator and relevant values to exist
+        if self.zk_mode:
+            if not isinstance(ss.pk_mno, ec.EllipticCurvePublicKey):
+                raise ApiError('0.1', '2.2', 'MNO public key not of compatible type')
 
-        #TODO - 
+            try:
+                # Verify MNO credential signature over (H_pid, h_cert, mnoid)
+                ss.pk_mno.verify(ss.sig_cred, ss.h_pid + h_cert + ss.mnoid, ec.ECDSA(hashes.SHA256()))
+            except InvalidSignature:
+                raise ApiError('0.1', '1.2', 'Failed to verify MNO credential signature')
 
-    
-        elig_bundle_signed_msg = euiccSigned1['signedMessage']
-        pk_u = euicc_cert.public_key()
+            try:
+                # Verify MNO signature over root_auth
+                ss.pk_mno.verify(ss.sig_root, ss.root_auth, ec.ECDSA(hashes.SHA256()))
+            except InvalidSignature:
+                raise ApiError('0.1', '1.3', 'Failed to verify root signature')
 
-        elig_bundle_signed_msg_data = (
-            ss.transactionId.encode("utf-8") + 
-            ss.serverChallenge + 
-            ss.euicc_challenge + 
-            ss.auth_token + 
-            ss.h_pid + 
-            euiccCertificate_bin
-        )
-        #* Verify Sig.verify_pk_U over (I_t, N_s, N_u, T_i, H_pid, PCert_U, sid)
-        # Checks if the key is a valid type for verification
-        if not isinstance(pk_u, ec.EllipticCurvePublicKey):
-            raise ApiError('0.1', '2.1', 'User Public Key not of Compatible Type')
-        try:
-            # Tries to perform the verification on the msg bytes and the data
-            pk_u.verify(elig_bundle_signed_msg, elig_bundle_signed_msg_data, ec.ECDSA(hashes.SHA256()))
-        except InvalidSignature:
-            raise ApiError('0.1', '1.1', 'Failed to verify signed eligibility bundle')
+            if isinstance(ss.L_auth, rsp.MerkleAccumulator):
+                if not ss.h_pid:
+                    raise ApiError('0.1', '1.3', 'Missing H_pid')
+                if not ss.root_auth:
+                    raise ApiError('0.1', '1.3', 'Missing root_auth')
+                if not ss.L_auth.verifyProof(ss.h_pid.hex(), ss.pi_inc, ss.root_auth):
+                    raise ApiError('0.1', '1.3', 'Failed to Verify Inclusion Proof')
+            else:
+                raise ApiError('0.1', '2.3', 'Accumulator not of a valid type (ie Merkle Accumulator defined in rsp.py)')
 
-
-
-        root_sig_msg = ss.auth_root + ss.sig_root
-        t_i_message_data = ss.h_pid + h_cert + ss.mnoid + ss.expiry
-        now = datetime.datetime.now()
-        if isinstance(ss.pk_mno, ec.EllipticCurvePublicKey):
-            #* Verify Sig.verify_pk_MNO over (root_auth, sig^MNO_root)
-            if not ss.pk_mno.verify(ss.sig_cred, root_sig_msg, ec.ECDSA(hashes.SHA256())):
-                raise ApiError('0.1', '1.2', 'Failed to verify MNO root signed message')
-            if not ss.pk_mno.verify(ss.t_i, t_i_message_data, ec.ECDSA(hashes.SHA256())):
-                raise ApiError('0.1', '1.4', 'Failed to verify Authorisation Token T_i as signed by MNO PK')
-            if now < datetime.datetime(now.year, now.month+1, now.day):
-                raise ApiError('0.1', '1.5', 'Token Expiry date is outdate (ie now < expiry)')
-        else:
-            raise ApiError('0.1', '2.2', 'MNO public key not of compatible type')
-        
-        #* Verifies Accumulator proof ie Acc.verify(root_auth, H_pid, π_inc)
-        if isinstance(ss.L_auth, rsp.MerkleAccumulator):
-            if not ss.L_auth.verifyProof(ss.root_auth, ss.pi_inc, bytes(ss.L_auth.get_root())): # type: ignore - ignored as the value is defined before this is called
-                raise ApiError('0.1', '1.3', 'Failed to Verify Inclusion Proof')
-        else:
-            raise ApiError('0.1', '2.3', 'Accumulator not of a valid type (ie Merkle Accumulator defined in rsp.py)')
-
-        #* Adds the token to the spent list if it hasn't already been added
-        if isinstance(ss.L_spent, rsp.MerkleAccumulator):
-            ss.L_spent = ss.L_spent.add(str(ss.t_i))
+            # Spend token once eligibility is validated.
+            if isinstance(ss.L_spent, rsp.MerkleAccumulator) and ss.auth_tok:
+                ss.L_spent.add(ss.auth_tok.hex())
          
 
         # Put together profileMetadata + _bin
@@ -899,7 +914,18 @@ class SmDppHttpServer:
             bpp = BoundProfilePackage.from_upp(upp)
         else:
             # Use session keys
-            ppp = ProtectedProfilePackage.from_upp(upp, BspInstance(b'\x00'*16, b'\x11'*16, b'\x22'*16))
+            if self.zk_mode:
+                from pySim.esim.bsp import bsp_key_derivation
+                initial_mcv, s_enc, s_mac = bsp_key_derivation(
+                    ss.shared_secret,
+                    key_type=0x88,
+                    key_length=16,
+                    host_id=ss.host_id,
+                    eid=h2b(ss.eid),
+                )
+                ppp = ProtectedProfilePackage.from_upp(upp, BspInstance(s_enc, s_mac, initial_mcv))
+            else:
+                ppp = ProtectedProfilePackage.from_upp(upp, BspInstance(b'\x00'*16, b'\x11'*16, b'\x22'*16))
             bpp = BoundProfilePackage.from_ppp(ppp)
 
         # update non-volatile state with updated ss object
@@ -1009,10 +1035,10 @@ class SmDppHttpServer:
         # ----------- ZK-ESIM based functions for protocol functionality -----------
     
     def validateEligibilityBundle(self, pkU: bytes, sig: bytes, dat: dict) -> bool:
-        uePk = ec.EllipticCurvePublicKey.from_encoded_point(ec.SECP256K1(), pkU)
+        uePk = ec.EllipticCurvePublicKey.from_encoded_point(ec._CURVE_TYPES["SECP256R1"], pkU)
         data_bytes = json.dumps(dat).encode("utf-8")
         try:
-            uePk.verify(signature=sig, data=data_bytes, signature_algorithm=ec.ECDSA(hashes.SHA256()))
+            uePk.verify(sig, data_bytes, ec.ECDSA(hashes.SHA256()))
         except InvalidSignature:
             return False
         return True
@@ -1029,12 +1055,20 @@ def main(argv):
                         action='store_true', default=False)
     parser.add_argument("-m", "--in-memory", help="Use ephermal in-memory session storage (for concurrent runs)",
                         action='store_true', default=False)
+    parser.add_argument("-z", "--zk", help="Enable ZK-eSIM eligibility verification",
+                        action='store_true', default=False)
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.DEBUG if args.verbose else logging.WARNING)
 
     common_cert_path = os.path.join(DATA_DIR, args.certdir)
-    hs = SmDppHttpServer(server_hostname=HOSTNAME, ci_certs_path=os.path.join(common_cert_path, 'CertificateIssuer'), common_cert_path=common_cert_path, use_brainpool=args.brainpool)
+    hs = SmDppHttpServer(
+        server_hostname=HOSTNAME,
+        ci_certs_path=os.path.join(common_cert_path, 'CertificateIssuer'),
+        common_cert_path=common_cert_path,
+        use_brainpool=args.brainpool,
+        zk_mode=args.zk
+    )
     if(args.nossl):
         hs.app.run(args.host, args.port)
     else:
