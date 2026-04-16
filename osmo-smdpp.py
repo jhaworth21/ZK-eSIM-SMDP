@@ -1,4 +1,6 @@
-#!/usr/bin/env python3
+#! /Users/joshhaworth/Documents/pysim/.venv/bin/python3
+#? Update path above to fit python environment information
+
 
 # Early proof-of-concept towards a SM-DP+ HTTP service for GSMA consumer eSIM RSP
 #
@@ -143,82 +145,91 @@ logger = logging.getLogger(__name__)
 DATA_DIR = './smdpp-data'
 HOSTNAME = 'testsmdpplus1.example.com' # must match certificates!
 
-#* MNO-defined values - currently hardcoded or assigned via a function 
+
+
+# # * MNO-defined values - currently hardcoded or assigned via a function 
 # server_challenge = 0x873ECFD6 # added for server challenge section 
 
-# #* Accumulator values
-# L_spent = None
-# root_spent = None
-# L_auth = None
-# root_auth = None
-# pi_inc = None
+state_values = {
+#* Accumulator values
+"L_spent": rsp.MerkleAccumulator,
+"root_spent": bytes,
+"L_auth":  rsp.MerkleAccumulator,
+"root_auth": bytes,
+"sig_root": bytes,
+"pi_inc": list[bytes] | None,
+#* Pseudonym Id values (both pid and the hash of pid - H_pid)
+"pid":  bytes,
+"h_pid": bytes,
+"h_cert": bytes,
+#* MNO key and identifier values
+"sk_mno": ec.EllipticCurvePrivateKey,
+"pk_mno": ec.EllipticCurvePublicKey,
+"mnoid": str,
+"auth_tok": bytes,
+#* MNO-based signatures
+"sig_cred": bytes,
+"expiry": bytes
+}
 
-# #* Pseudonym Id values (both pid and the hash of pid - H_pid)
-# pid = None
-# h_pid = None
-# h_cert = None
 
-# #* MNO key and identifier values
-# sk_mno = None
-# pk_mno = None
-# mnoid = None
-# auth_tok = None
+def setupMNOValues():
+    curve = ec.SECP256R1()
 
-# #* MNO-based signatures
-# sig_cred = None
-
-
-
-def setupMNOValues(ss):
     #* Generates a random PID value 
     pid = random.randbytes(16)
-    ss.pid = pid
+    state_values['pid'] = pid
+
     h_cert = random.randbytes(32)
-    ss.h_cert = h_cert
+    state_values['h_cert'] = h_cert
+
     #* Defines an mno_id as a byte string
     mnoid = b"MNO_id"
-    ss.mnoid = mnoid
+    state_values['mnoid'] = mnoid
 
     #* Hashes the pid value to generate the H_pid value
     digest = hashes.Hash(hashes.SHA256())
     digest.update(pid)
     h_pid = digest.finalize()
-    ss.h_pid = h_pid
+    state_values['h_pid'] = h_pid
 
     #* Sets up the keys needed for the MNO 
-    sk_mno = ec.generate_private_key(ec._CURVE_TYPES["SECP256K1"])
+    sk_mno = ec.generate_private_key(curve=curve)
+    state_values['sk_mno'] = sk_mno
     pk_mno = sk_mno.public_key()
-    ss.pk_mno = pk_mno
+    state_values['pk_mno'] = pk_mno
 
     #* Sets up two accumulators 
     #* Authorisation accumulator
     L_auth = rsp.MerkleAccumulator()
-    L_auth.add(h_pid.decode())
-    ss.L_auth = L_auth
-    root_auth = hash_fn(L_auth)    
-    ss.root_auth = root_auth
-    ss.sig_root = sk_mno.sign(root_auth, ec.ECDSA(hashes.SHA256()))
+    L_auth.add(base64.b64encode(h_pid).decode())  
+    state_values['L_auth'] = L_auth  
+
+    root_auth = L_auth.get_root()  
+    state_values['root_auth'] = root_auth
+    sig_root = sk_mno.sign(root_auth, ec.ECDSA(hashes.SHA256()))
+    state_values['sig_root'] = sig_root
+
     #* Spent token accumulator
     L_spent = rsp.MerkleAccumulator()
-    ss.L_spent = L_spent
-    root_spent = hash_fn(L_spent)
-    ss.root_spent = root_spent
+    state_values['L_spent'] = L_spent
+    root_spent = L_spent.get_root()
+    state_values['root_spent'] = root_spent
+
     #* Accumulator inclusion proof
-    pi_inc = L_auth.generateProof(h_pid.decode())
-    ss.pi_inc = pi_inc
+    pi_inc = L_auth.generateProof(base64.b64encode(h_pid).decode())
+    state_values['pi_inc'] = pi_inc
 
     sig_cred = bytes(h_pid + h_cert + mnoid)
-    ss.sig_cred = sk_mno.sign(sig_cred, ec.ECDSA(hashes.SHA256()))
+    state_values['sig_cred'] = sig_cred
 
     #* Authorisation token generation 
     now = datetime.datetime.now()
     expiry = datetime.datetime(now.year, now.month+1, now.day).ctime().encode("utf-8")
-    ss.expiry = expiry
+    state_values['expiry'] = expiry
     tok_data = h_pid + h_cert + mnoid + expiry
     auth_tok = sk_mno.sign(data=tok_data, signature_algorithm=ec.ECDSA(hashes.SHA256()))
-    ss.auth_tok = auth_tok
-
-    return ss
+    state_values['auth_tok'] = auth_tok
 
 def hash_fn(input):
     digest = hashes.Hash(hashes.SHA256())
@@ -627,6 +638,8 @@ class SmDppHttpServer:
         output['serverSignature1'] = b64encode2str(b'\x5f\x37\x40' + self.dp_auth.ecdsa_sign(serverSigned1_bin))
 
         output['transactionId'] = transactionId
+        output['smdpNonce'] = b64encode2str(serverChallenge)
+        output['transcriptNonce'] = transactionId
         server_cert_aki = self.dp_auth.get_authority_key_identifier()
         output['euiccCiPKIdToBeUsed'] = b64encode2str(b'\x04\x14' + server_cert_aki.key_identifier)
         output['serverCertificate'] = b64encode2str(self.dp_auth.get_cert_as_der()) # CERT.DPauth.SIG
@@ -636,8 +649,8 @@ class SmDppHttpServer:
         # create SessionState and store it in rss
         self.rss[transactionId] = rsp.RspSessionState(transactionId, serverChallenge,
                                                       cert_get_subject_key_id(ci_cert))
-        ss = self.rss[transactionId]
-        self.rss[transactionId] = setupMNOValues(ss)
+        
+        setupMNOValues()
 
         return output
 
@@ -645,7 +658,9 @@ class SmDppHttpServer:
     @rsp_api_wrapper
     def authenticateClient(self, request: IRequest, content: dict) -> dict:
         """See ES9+ AuthenticateClient in SGP.22 Section 5.6.3"""
+        print("Content = ", content)
         transactionId = content['transactionId']
+        # print(f"++++++++++++++++++++++\n Transaction Id = {transactionId}\n ++++++++++++++++++++++")
 
         authenticateServerResp_bin = b64decode(content['authenticateServerResponse'])
         authenticateServerResp = rsp.asn1.decode('AuthenticateServerResponse', authenticateServerResp_bin)
@@ -682,9 +697,9 @@ class SmDppHttpServer:
         #* creates the h_cert (ie H''(PCert_U)) - overwrites the default defined value from SetupMNO
         digest = hashes.Hash(hashes.SHA256())
         digest.update(euiccCertificate_bin)
+
         h_cert = digest.finalize()
-        ss.setHCert(h_cert)
-        self.rss[transactionId] = ss
+        state_values['h_cert'] = h_cert
     
         # Verify that the Root Certificate of the eUICC certificate chain corresponds to the
         # euiccCiPKIdToBeUsed
@@ -756,8 +771,6 @@ class SmDppHttpServer:
         # TODO - add checks for MNO signature cerification??
         # TODO - add accumulator verification?? - requires the accumulator and relevant values to exist
 
-        #TODO - 
-
     
         elig_bundle_signed_msg = euiccSigned1['signedMessage']
         pk_u = euicc_cert.public_key()
@@ -766,8 +779,10 @@ class SmDppHttpServer:
             ss.transactionId.encode("utf-8") + 
             ss.serverChallenge + 
             ss.euicc_challenge + 
-            ss.auth_token + 
-            ss.h_pid + 
+            state_values['auth_token'] +
+            # ss.auth_token + 
+            # ss.h_pid + 
+            state_values['h_pid'] +
             euiccCertificate_bin
         )
         #* Verify Sig.verify_pk_U over (I_t, N_s, N_u, T_i, H_pid, PCert_U, sid)
@@ -782,30 +797,34 @@ class SmDppHttpServer:
 
 
 
-        root_sig_msg = ss.auth_root + ss.sig_root
-        t_i_message_data = ss.h_pid + h_cert + ss.mnoid + ss.expiry
+        # root_sig_msg = ss.auth_root + ss.sig_root
+        root_sig_msg = state_values['root_auth'] + state_values['sig_root']
+        # t_i_message_data = ss.h_pid + h_cert + ss.mnoid + ss.expiry
+        t_i_message_data = state_values['h_pid'] + state_values['h_cert'] + state_values['mnoid'] + state_values['expiry']
         now = datetime.datetime.now()
-        if isinstance(ss.pk_mno, ec.EllipticCurvePublicKey):
+        mnoPk = state_values['pk_mno']
+        if isinstance(mnoPk, ec.EllipticCurvePublicKey):
             #* Verify Sig.verify_pk_MNO over (root_auth, sig^MNO_root)
-            if not ss.pk_mno.verify(ss.sig_cred, root_sig_msg, ec.ECDSA(hashes.SHA256())):
+            if not mnoPk.verify(state_values['sig_cred'], root_sig_msg, ec.ECDSA(hashes.SHA256())):
                 raise ApiError('0.1', '1.2', 'Failed to verify MNO root signed message')
-            if not ss.pk_mno.verify(ss.t_i, t_i_message_data, ec.ECDSA(hashes.SHA256())):
+            if not mnoPk.verify(state_values['auth_tok'], t_i_message_data, ec.ECDSA(hashes.SHA256())):
                 raise ApiError('0.1', '1.4', 'Failed to verify Authorisation Token T_i as signed by MNO PK')
+            #* Recreates the expiration date rather than 
             if now < datetime.datetime(now.year, now.month+1, now.day):
                 raise ApiError('0.1', '1.5', 'Token Expiry date is outdate (ie now < expiry)')
         else:
             raise ApiError('0.1', '2.2', 'MNO public key not of compatible type')
         
         #* Verifies Accumulator proof ie Acc.verify(root_auth, H_pid, π_inc)
-        if isinstance(ss.L_auth, rsp.MerkleAccumulator):
-            if not ss.L_auth.verifyProof(ss.root_auth, ss.pi_inc, bytes(ss.L_auth.get_root())): # type: ignore - ignored as the value is defined before this is called
+        if isinstance(state_values['L_auth'], rsp.MerkleAccumulator):
+            if not state_values['L_auth'].verifyProof(state_values['root_auth'], state_values['pi_inc'], state_values['L_auth'].get_root()):
                 raise ApiError('0.1', '1.3', 'Failed to Verify Inclusion Proof')
         else:
             raise ApiError('0.1', '2.3', 'Accumulator not of a valid type (ie Merkle Accumulator defined in rsp.py)')
 
         #* Adds the token to the spent list if it hasn't already been added
-        if isinstance(ss.L_spent, rsp.MerkleAccumulator):
-            ss.L_spent = ss.L_spent.add(str(ss.t_i))
+        if isinstance(state_values['L_spent'], rsp.MerkleAccumulator):
+            state_values['L_spent'].add(str(ss.t_i))
          
 
         # Put together profileMetadata + _bin

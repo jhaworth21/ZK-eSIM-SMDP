@@ -53,27 +53,25 @@ class RspSessionState:
         self.smdp_otpk: Optional[bytes] = None
         self.host_id: Optional[bytes] = None
         self.shared_secret: Optional[bytes] = None
-        #* Added state values for zk-eSIM 
+        # #* Added state values for zk-eSIM 
         self.euicc_challenge: Optional[bytes] = None            #* Added EUICC challenge (N_u)
-        self.h_cert: Optional[bytes] = None                     #* Added hashed pseudonym ceritificate (h_cert)
-        self.t_i: Optional[bytes] = None                        #* Added authorisation token (ie T_i)
-        self.L_spent: Optional[MerkleAccumulator] = None        #* Added accumulator to the RSP (L_spent)
-        self.root_spent: Optional[bytes] = None                 #* Added hash of L_spent (root_spent)
-        self.L_auth: Optional[MerkleAccumulator] = None         #* Added accumulator for auth tokens (L_auth)
-        self.root_auth: Optional[bytes] = None                  #* Added hash of L_auth (root_auth)
-        self.pi_inc: Optional[list] = None                      #* Added proof of inclusion in accumulator (π_inc)
-        #* Pseudonym Id values (both pid and the hash of pid - H_pid)
-        self.pid: Optional[bytes] = None                        #* Added per session pseudonym (pid)
-        self.h_pid: Optional[bytes] = None                      #* Added hash of pid (H_pid)
-        #* MNO key and identifier values    
-        #! self.sk_mno: Optional[bytes] = None                  # Not used but needed to generate the public key               
-        self.pk_mno: Optional[ec.EllipticCurvePublicKey] = None #* Added public key for the mno - may need to be hardcoded
-        self.mnoid: Optional[bytes] = None                      #* Added the mno id - endcoded string as utf-8
-        self.auth_tok: Optional[bytes] = None                   #* Added authorisation token (T_i) - one time token
-        self.expiry: Optional[bytes] = None                     #* Added expiry of the auth_token for the T_i verification step
-        #* MNO-based signatures
-        self.sig_cred: Optional[bytes] = None                   #* Added signature over (H_pid, h_cert, mnoid)
-        self.sig_root: Optional[bytes] = None                   #* Added signature over (root_auth, sig^MNO_root)
+        #! Delete below - not used anymore
+        # self.h_cert: Optional[bytes] = None                     #* Added hashed pseudonym ceritificate (h_cert)
+        # self.t_i: Optional[bytes] = None                        #* Added authorisation token (ie T_i)
+        # self.root_spent: Optional[bytes] = None                 #* Added hash of L_spent (root_spent)
+        # self.root_auth: Optional[bytes] = None                  #* Added hash of L_auth (root_auth)
+        # self.pi_inc: Optional[list] = None                      #* Added proof of inclusion in accumulator (π_inc)
+        # #* Pseudonym Id values (both pid and the hash of pid - H_pid)
+        # self.pid: Optional[bytes] = None                        #* Added per session pseudonym (pid)
+        # self.h_pid: Optional[bytes] = None                      #* Added hash of pid (H_pid)
+        # #* MNO key and identifier values    
+        # #! self.sk_mno: Optional[bytes] = None                  # Not used but needed to generate the public key               
+        # self.mnoid: Optional[bytes] = None                      #* Added the mno id - endcoded string as utf-8
+        # self.auth_tok: Optional[bytes] = None                   #* Added authorisation token (T_i) - one time token
+        # self.expiry: Optional[bytes] = None                     #* Added expiry of the auth_token for the T_i verification step
+        # #* MNO-based signatures
+        # self.sig_cred: Optional[bytes] = None                   #* Added signature over (H_pid, h_cert, mnoid)
+        # self.sig_root: Optional[bytes] = None                   #* Added signature over (root_auth, sig^MNO_root)
         
 
 
@@ -179,6 +177,7 @@ class RspSessionStore:
 def extract_euiccSigned1(authenticateServerResponse: bytes) -> bytes:
     """Extract the raw, DER-encoded binary euiccSigned1 field from the given AuthenticateServerResponse. This
     is needed due to the very peculiar SGP.22 notion of signing sections of DER-encoded ASN.1 objects."""
+    print("failed to extract euicc Signed")
     rawtag, l, v, remainder = bertlv_parse_one_rawtag(authenticateServerResponse)
     if len(remainder):
         raise ValueError('Excess data at end of TLV')
@@ -208,21 +207,23 @@ def extract_euiccSigned2(prepareDownloadResponse: bytes) -> bytes:
         raise ValueError('Unexpected tag where SEQUENCE was expected')
     return tlv2
 
-def hash_fn(input):
-    digest = hashes.Hash(hashes.SHA384())
-    digest.update(input)
+def hash_fn(data: bytes) -> bytes:
+    if isinstance(data, str):
+        data = data.encode()
+    digest = hashes.Hash(hashes.SHA256())
+    digest.update(data)
     return digest.finalize()
 
 class MerkleAccumulator():
 
     def __init__(self):
         self.leaves = {}
-        self.root = []
+        self.root = bytes.fromhex("00")
 
     def _compute_root(self):
         nodes = list(self.leaves.values())
         if not nodes:
-            self.root = None
+            self.root = bytes.fromhex("00")
             return
 
         while len(nodes) > 1:
@@ -246,7 +247,7 @@ class MerkleAccumulator():
             del self.leaves[element]
             self._compute_root()
 
-    def get_root(self):
+    def get_root(self) -> bytes:
         return self.root
     
     def generateProof(self, element: str):
