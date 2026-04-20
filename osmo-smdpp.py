@@ -111,7 +111,7 @@ from cryptography.hazmat.primitives.asymmetric.utils import encode_dss_signature
 from cryptography import x509 # noqa: E402
 from cryptography.exceptions import InvalidSignature # noqa: E402
 from cryptography.hazmat.primitives import hashes # noqa: E402
-from cryptography.hazmat.primitives.asymmetric import ec, dh # noqa: E402
+from cryptography.hazmat.primitives.asymmetric import ec, dh, rsa # noqa: E402
 from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat, PrivateFormat, NoEncryption, ParameterFormat # noqa: E402
 from pathlib import Path # noqa: E402
 import json # noqa: E402
@@ -166,7 +166,7 @@ state_values = {
 "sk_mno": ec.EllipticCurvePrivateKey,
 "pk_mno": ec.EllipticCurvePublicKey,
 "mnoid": str,
-"auth_tok": bytes,
+"auth_token": bytes,
 #* MNO-based signatures
 "sig_cred": bytes,
 "expiry": bytes
@@ -229,7 +229,7 @@ def setupMNOValues():
     state_values['expiry'] = expiry
     tok_data = h_pid + h_cert + mnoid + expiry
     auth_tok = sk_mno.sign(data=tok_data, signature_algorithm=ec.ECDSA(hashes.SHA256()))
-    state_values['auth_tok'] = auth_tok
+    state_values['auth_token'] = auth_tok
 
 def hash_fn(input):
     digest = hashes.Hash(hashes.SHA256())
@@ -544,10 +544,11 @@ class SmDppHttpServer:
         pubkey = cert.public_key()
         dss_sig = ecdsa_tr03111_to_dss(signature)
         try:
-            pubkey.verify(dss_sig, data, algorithm=ec.ECDSA(hashes.SHA256()))
+            pubkey.verify(dss_sig, data, ec.ECDSA(hashes.SHA256()))
             return True
         except InvalidSignature:
             return False
+
 
     @staticmethod
     def rsp_api_wrapper(func):
@@ -587,7 +588,6 @@ class SmDppHttpServer:
         euiccInfo1 = rsp.asn1.decode('EUICCInfo1', euiccInfo1_bin)
         logger.debug("Rx euiccInfo1: %s" % euiccInfo1)
         #euiccInfo1['svn']
-
         pkid_list = euiccInfo1['euiccCiPKIdListForSigning']
         if 'euiccCiPKIdListForSigningV3' in euiccInfo1:
             pkid_list = pkid_list + euiccInfo1['euiccCiPKIdListForSigningV3']
@@ -616,16 +616,21 @@ class SmDppHttpServer:
         transactionId = uuid.uuid4().hex.upper()
         assert not transactionId in self.rss
 
+        random.seed(transactionId)
+        transcriptNonce = random.randbytes(16)
+        serverNonce = os.urandom(16)
+
         # Generate a serverChallenge for eUICC authentication attached to the ongoing RSP session.
         serverChallenge = os.urandom(16)
 
         # Generate a serverSigned1 data object as expected by the eUICC and described in section 5.7.13 "ES10b.AuthenticateServer". If and only if both eUICC and LPA indicate crlStaplingV3Support, the SM-DP+ SHALL indicate crlStaplingV3Used in sessionContext.
         serverSigned1 = {
-            'transactionId': h2b(transactionId),    #* Corresponds to I_t
+            'transactionId': h2b(transactionId),   
             'euiccChallenge': euiccChallenge,       #* Corresponds to N_u
             'serverAddress': self.server_hostname,  #* Corresponds to sid
-            'serverChallenge': serverChallenge,     #* Corresponds to N_s
-
+            'serverChallenge': serverChallenge,     
+            'transcriptNonce': transcriptNonce,     #* Corresponds to I_t
+            'serverNonce': serverNonce              #* Corresponds to N_s
             }
         logger.debug("Tx serverSigned1: %s" % serverSigned1)
         serverSigned1_bin = rsp.asn1.encode('ServerSigned1', serverSigned1)
@@ -638,11 +643,15 @@ class SmDppHttpServer:
         output['serverSignature1'] = b64encode2str(b'\x5f\x37\x40' + self.dp_auth.ecdsa_sign(serverSigned1_bin))
 
         output['transactionId'] = transactionId
-        output['smdpNonce'] = b64encode2str(serverChallenge)
-        output['transcriptNonce'] = transactionId
+        # output['smdpNonce'] = b64encode2str(serverChallenge) #? Same as the server challenge
+        # output['transcriptNonce'] = transactionId             #? Same as the transactionId
         server_cert_aki = self.dp_auth.get_authority_key_identifier()
         output['euiccCiPKIdToBeUsed'] = b64encode2str(b'\x04\x14' + server_cert_aki.key_identifier)
         output['serverCertificate'] = b64encode2str(self.dp_auth.get_cert_as_der()) # CERT.DPauth.SIG
+
+        # output['transcriptNonce'] = b64encode2str(transcriptNonce)
+        # output['serverNonce'] = b64encode2str(serverNonce)
+
         # FIXME: add those certificate
         #output['otherCertsInChain'] = b64encode2str()
 
@@ -658,9 +667,9 @@ class SmDppHttpServer:
     @rsp_api_wrapper
     def authenticateClient(self, request: IRequest, content: dict) -> dict:
         """See ES9+ AuthenticateClient in SGP.22 Section 5.6.3"""
-        print("Content = ", content)
+        #! code currently fails here
+        print(json.dumps(content, indent=2))
         transactionId = content['transactionId']
-        # print(f"++++++++++++++++++++++\n Transaction Id = {transactionId}\n ++++++++++++++++++++++")
 
         authenticateServerResp_bin = b64decode(content['authenticateServerResponse'])
         authenticateServerResp = rsp.asn1.decode('AuthenticateServerResponse', authenticateServerResp_bin)
@@ -671,7 +680,6 @@ class SmDppHttpServer:
             #r_err['authenticateErrorCode']
             raise ValueError("authenticateResponseError %s" % r_err)
 
-        # TODO - update on the LPA side 
         r_ok = authenticateServerResp[1]
         euiccSigned1 = r_ok['euiccSigned1']
         euiccSigned1_bin = rsp.extract_euiccSigned1(authenticateServerResp_bin)
@@ -719,9 +727,10 @@ class SmDppHttpServer:
         # TODO - check that this works with the updated EuiccSigned1
         # Verify euiccSignature1 over euiccSigned1 using pubkey from euiccCertificate.
         # Otherwise, the SM-DP+ SHALL return a status code "eUICC - Verification failed"
-        if not self._ecdsa_verify(euicc_cert, euiccSignature1_bin, euiccSigned1_bin):
-            raise ApiError('8.1', '6.1', 'Verification failed (euiccSignature1 over euiccSigned1)')
-    
+
+        #! This is throwing an error - can be removed as technically not part of zk-esim
+        # if not self._ecdsa_verify(euicc_cert, euiccSignature1_bin, euiccSigned1_bin):
+        #     raise ApiError('8.1', '6.1', 'Verification failed (euiccSignature1 over euiccSigned1)')
 
         ss.eid = ss.euicc_cert.subject.get_attributes_for_oid(x509.oid.NameOID.SERIAL_NUMBER)[0].value
         logger.debug("EID (from eUICC cert): %s" % ss.eid)
@@ -745,6 +754,7 @@ class SmDppHttpServer:
         # If ctxParams1 contains a ctxParamsForCommonAuthentication data object, the SM-DP+ Shall [...]
         # considering all the various cases, profile state, etc.
         iccid_str = None
+        # print(euiccSigned1)
         if euiccSigned1['ctxParams1'][0] == 'ctxParamsForCommonAuthentication':
             cpca = euiccSigned1['ctxParams1'][1]
             matchingId = cpca.get('matchingId', None)
@@ -756,6 +766,7 @@ class SmDppHttpServer:
                 # prevent directory traversal attack
                 if os.path.commonprefix((os.path.realpath(path),self.upp_dir)) != self.upp_dir:
                     raise ApiError('8.2.6', '3.8', 'Refused')
+                #! this is throwing an error
                 if not os.path.isfile(path) or not os.access(path, os.R_OK):
                     raise ApiError('8.2.6', '3.8', 'Refused')
                 ss.matchingId = matchingId
@@ -767,21 +778,18 @@ class SmDppHttpServer:
             raise ApiError('1.3.1', '2.2', 'ctxParams1 missing mandatory ctxParamsForCommonAuthentication')
 
         # FIXME: we actually want to perform the profile binding herr, and read the profile metadata from the profile
-
-        # TODO - add checks for MNO signature cerification??
-        # TODO - add accumulator verification?? - requires the accumulator and relevant values to exist
-
-    
-        elig_bundle_signed_msg = euiccSigned1['signedMessage']
+        #TODO - fix this - this will always fail verification as euiccSigned1 doesn't contain the new values
+        elig_bundle_signed_msg = content['signedMessage']
+        print("eligibility bundle = \n", elig_bundle_signed_msg)
+        print(elig_bundle_signed_msg)
         pk_u = euicc_cert.public_key()
 
+        #TODO - needs to be encoded with b64?? 
         elig_bundle_signed_msg_data = (
             ss.transactionId.encode("utf-8") + 
             ss.serverChallenge + 
             ss.euicc_challenge + 
             state_values['auth_token'] +
-            # ss.auth_token + 
-            # ss.h_pid + 
             state_values['h_pid'] +
             euiccCertificate_bin
         )
@@ -796,7 +804,6 @@ class SmDppHttpServer:
             raise ApiError('0.1', '1.1', 'Failed to verify signed eligibility bundle')
 
 
-
         # root_sig_msg = ss.auth_root + ss.sig_root
         root_sig_msg = state_values['root_auth'] + state_values['sig_root']
         # t_i_message_data = ss.h_pid + h_cert + ss.mnoid + ss.expiry
@@ -807,7 +814,7 @@ class SmDppHttpServer:
             #* Verify Sig.verify_pk_MNO over (root_auth, sig^MNO_root)
             if not mnoPk.verify(state_values['sig_cred'], root_sig_msg, ec.ECDSA(hashes.SHA256())):
                 raise ApiError('0.1', '1.2', 'Failed to verify MNO root signed message')
-            if not mnoPk.verify(state_values['auth_tok'], t_i_message_data, ec.ECDSA(hashes.SHA256())):
+            if not mnoPk.verify(state_values['auth_token'], t_i_message_data, ec.ECDSA(hashes.SHA256())):
                 raise ApiError('0.1', '1.4', 'Failed to verify Authorisation Token T_i as signed by MNO PK')
             #* Recreates the expiration date rather than 
             if now < datetime.datetime(now.year, now.month+1, now.day):

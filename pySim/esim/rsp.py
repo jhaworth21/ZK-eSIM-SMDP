@@ -177,8 +177,13 @@ class RspSessionStore:
 def extract_euiccSigned1(authenticateServerResponse: bytes) -> bytes:
     """Extract the raw, DER-encoded binary euiccSigned1 field from the given AuthenticateServerResponse. This
     is needed due to the very peculiar SGP.22 notion of signing sections of DER-encoded ASN.1 objects."""
-    print("failed to extract euicc Signed")
+    # print("failed to extract euicc Signed")
     rawtag, l, v, remainder = bertlv_parse_one_rawtag(authenticateServerResponse)
+    # print("rawtag = \n", rawtag)
+    # print("l = \n", l)
+    # print("v = \n", v)
+    # print("remainder = \n", remainder)
+
     if len(remainder):
         raise ValueError('Excess data at end of TLV')
     if rawtag != 0xbf38:
