@@ -24,7 +24,10 @@
 #
 
 import logging
-from cmd2 import style
+try:
+    from cmd2 import style
+except ImportError:
+    from cmd2 import styles as style
 
 class _PySimLogHandler(logging.Handler):
     def __init__(self, log_callback):
