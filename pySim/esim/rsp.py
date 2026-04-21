@@ -20,7 +20,7 @@ from typing import Optional
 import shelve
 
 from cryptography.hazmat.primitives.asymmetric import ec
-from cryptography.hazmat.primitives.serialization import Encoding
+from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat, load_der_public_key
 from cryptography.hazmat.primitives import hashes # noqa: E402
 from cryptography.hazmat.primitives.asymmetric import ec # noqa: E402
 
@@ -94,6 +94,10 @@ class RspSessionState:
             state['_smdp_otsk'] = self.smdp_ot.private_numbers().private_value
             state['_smdp_ot_curve'] = self.smdp_ot.curve
             del state['smdp_ot']
+        # serialize MNO public key for zk mode session persistence
+        if state.get('pk_mno', None):
+            state['_pk_mno'] = self.pk_mno.public_bytes(Encoding.DER, PublicFormat.SubjectPublicKeyInfo)
+            del state['pk_mno']
         return state
 
     def __setstate__(self, state):
@@ -115,6 +119,12 @@ class RspSessionState:
             # FIXME: how to add the public key from smdp_otpk to an instance of EllipticCurvePrivateKey?
             del state['_smdp_otsk']
             del state['_smdp_ot_curve']
+        # restore MNO public key for zk mode
+        if '_pk_mno' in state:
+            self.pk_mno = load_der_public_key(state['_pk_mno'])
+            del state['_pk_mno']
+        else:
+            self.pk_mno = None
         # automatically recover all the remaining state
         self.__dict__.update(state)
 
