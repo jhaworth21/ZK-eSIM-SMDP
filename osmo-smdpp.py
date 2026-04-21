@@ -667,11 +667,11 @@ class SmDppHttpServer:
     @rsp_api_wrapper
     def authenticateClient(self, request: IRequest, content: dict) -> dict:
         """See ES9+ AuthenticateClient in SGP.22 Section 5.6.3"""
-        #! code currently fails here
         print(json.dumps(content, indent=2))
         transactionId = content['transactionId']
 
         authenticateServerResp_bin = b64decode(content['authenticateServerResponse'])
+        #! code currently fails here - missing transcriptNonce 
         authenticateServerResp = rsp.asn1.decode('AuthenticateServerResponse', authenticateServerResp_bin)
         logger.debug("Rx %s: %s" % authenticateServerResp)
         if authenticateServerResp[0] == 'authenticateResponseError':
@@ -745,12 +745,6 @@ class SmDppHttpServer:
         if euiccSigned1['serverChallenge'] != ss.serverChallenge:
             raise ApiError('8.1', '6.1', 'Verification failed (serverChallenge)')
 
-        # #* Added validation for the 
-        # # TODO - update encoding type if necessary
-        # # TODO - check that the euiccSigned1 is the correct type - ie a dictionary of the expected values
-        # if not self.validateEligibilityBundle(cs.root_cert.public_bytes(Encoding.X962), euiccSignature1_bin, euiccSigned1):
-        #     raise ApiError('20.1', '6.1', 'Failed to validate Eligibility Bundle')
-
         # If ctxParams1 contains a ctxParamsForCommonAuthentication data object, the SM-DP+ Shall [...]
         # considering all the various cases, profile state, etc.
         iccid_str = None
@@ -766,7 +760,6 @@ class SmDppHttpServer:
                 # prevent directory traversal attack
                 if os.path.commonprefix((os.path.realpath(path),self.upp_dir)) != self.upp_dir:
                     raise ApiError('8.2.6', '3.8', 'Refused')
-                #! this is throwing an error
                 if not os.path.isfile(path) or not os.access(path, os.R_OK):
                     raise ApiError('8.2.6', '3.8', 'Refused')
                 ss.matchingId = matchingId

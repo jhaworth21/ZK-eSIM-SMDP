@@ -289,7 +289,13 @@ AuthenticateResponseOk ::= SEQUENCE {
     euiccSigned1 EuiccSigned1,      -- Signed information
     euiccSignature1 [APPLICATION 55] OCTET STRING,  --EUICC_Sign1, tag 5F37
     euiccCertificate Certificate,   -- eUICC Certificate (CERT.EUICC.ECDSA) signed by the EUM
-    eumCertificate Certificate  -- EUM Certificate (CERT.EUM.ECDSA) signed by the requested CI
+    eumCertificate Certificate,  -- EUM Certificate (CERT.EUM.ECDSA) signed by the requested CI
+    pseudonymCertificate [0] Certificate, --* Added for PCertU
+    authCredential [1] OCTET STRING OPTIONAL,      --* Added for sigma_cred   
+    hashedPseudonym [2] OCTET STRING OPTIONAL,     --* Added for Hpid
+    inclusionProof [3] OCTET STRING OPTIONAL,      --* Added for π_inc
+    accumulatorRoot [4] OCTET STRING OPTIONAL,     --* Added for auth_root
+    mnoRootSignature [5] OCTET STRING OPTIONAL     --* Added for sigma^root_MNO
 }
  
 EuiccSigned1 ::= SEQUENCE {
@@ -297,7 +303,14 @@ EuiccSigned1 ::= SEQUENCE {
     serverAddress [3] UTF8String,
     serverChallenge [4] Octet16,    -- The RSP Server Challenge
     euiccInfo2 [34] EUICCInfo2,
-    ctxParams1 CtxParams1
+    ctxParams1 CtxParams1,
+    transcriptNonce [5] OCTET STRING OPTIONAL,       --* I_t
+    serverNonce [6] OCTET STRING OPTIONAL,           --* N_S
+    euiccNonce [7] OCTET STRING OPTIONAL,            --* N_U
+    authCredential [8] OCTET STRING OPTIONAL,        --* sigma_cred
+    hashedPseudonym [9] OCTET STRING OPTIONAL,       --* Hpid
+    pseudonymCertificate [10] Certificate OPTIONAL,  --* PCertU
+    sid [11] OCTET STRING OPTIONAL                   --* sid
 }
  
 AuthenticateResponseError ::= SEQUENCE {
