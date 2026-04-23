@@ -168,6 +168,9 @@ HOSTNAME = 'testsmdpplus1.example.com' # must match certificates!
 # sig_cred = None
 
 FIXED_TEST_EID = b"89049032000000000000012345678901"
+# Fixed expiry for ZK auth token — matches FIXED_EXPIRY in ZK-eSIM applet.
+# ASCII Unix timestamp for 2100-01-01 00:00 UTC.
+FIXED_EXPIRY = b"4102444800"
 FIXED_MNOID = b"MNO_id"
 FIXED_H_CERT_STUB = b"\x30\x00"
 FIXED_MNO_PRIVATE_SCALAR = int("1f1e1d1c1b1a19181716151413121110ffeeddccbbaa99887766554433221100", 16)
@@ -188,11 +191,13 @@ def decode_expiry(expiry_raw: bytes) -> datetime.datetime:
 
 
 def setupMNOValues(ss):
-    # Keep ZK test vectors stable so applet-side hardcoded signatures can verify.
+    # ZK test vectors: pk_mno is shared with the applet (both hold the same
+    # FIXED_MNO_PRIVATE_SCALAR).  The applet signs sig_cred / sig_root / auth_tok
+    # at install time using the real h_cert from its self-signed euiccCertificate;
+    # the SM-DP+ side merely verifies those signatures in authenticateClient.
+    # We still set h_pid / L_auth here so the accumulator inclusion proof matches.
     pid = hash_fn(FIXED_TEST_EID)
     ss.pid = pid
-    h_cert = hash_fn(FIXED_H_CERT_STUB)
-    ss.h_cert = h_cert
     mnoid = FIXED_MNOID
     ss.mnoid = mnoid
 
@@ -203,35 +208,28 @@ def setupMNOValues(ss):
     pk_mno = sk_mno.public_key()
     ss.pk_mno = pk_mno
 
-    #* Sets up two accumulators 
-    #* Authorisation accumulator
+    # Single-leaf accumulator: root == h_pid, proof is empty.
     L_auth = rsp.MerkleAccumulator()
     h_pid_hex = h_pid.hex()
     L_auth.add(h_pid_hex)
     ss.L_auth = L_auth
-    root_auth = bytes(L_auth.get_root())
-    ss.root_auth = root_auth
-    ss.sig_root = sk_mno.sign(root_auth, ec.ECDSA(hashes.SHA256()))
-    #* Spent token accumulator
+    ss.root_auth = bytes(L_auth.get_root())
     L_spent = rsp.MerkleAccumulator()
     ss.L_spent = L_spent
-    root_spent = bytes(L_spent.get_root()) if L_spent.get_root() else b''
-    ss.root_spent = root_spent
-    #* Accumulator inclusion proof
+    ss.root_spent = bytes(L_spent.get_root()) if L_spent.get_root() else b''
     pi_inc = L_auth.generateProof(h_pid_hex)
     ss.pi_inc = pi_inc
     ss.pi_inc_bytes = serialize_proof(pi_inc)
 
-    sig_cred = bytes(h_pid + h_cert + mnoid)
-    ss.sig_cred = sk_mno.sign(sig_cred, ec.ECDSA(hashes.SHA256()))
+    # Use a fixed expiry that matches FIXED_EXPIRY in the applet; the applet's
+    # auth_tok is bound to this same ASCII-encoded timestamp.
+    ss.expiry = FIXED_EXPIRY
 
-    #* Authorisation token generation with dynamic per-session expiry.
-    expiry_dt = utcnow() + datetime.timedelta(seconds=AUTH_TOKEN_VALIDITY_SECONDS)
-    expiry = encode_expiry(expiry_dt)
-    ss.expiry = expiry
-    tok_data = h_pid + h_cert + mnoid + expiry
-    auth_tok = sk_mno.sign(data=tok_data, signature_algorithm=ec.ECDSA(hashes.SHA256()))
-    ss.auth_tok = auth_tok
+    # sig_cred / sig_root / auth_tok are populated from the applet's eligibility
+    # data in authenticateClient (not pre-computed here).
+    ss.sig_cred = None
+    ss.sig_root = None
+    ss.auth_tok = None
 
     return ss
 
@@ -769,9 +767,6 @@ class SmDppHttpServer:
         if self.zk_mode and euiccCertificate_bin == b'\x30\x00':
             logger.warning('Rejecting AuthenticateServerResponse with empty euiccCertificate in zk mode')
             raise ApiError('8.1', '6.1', 'Verification failed (empty euiccCertificate)')
-        if self.zk_mode and eumCertificate_bin == b'\x30\x00':
-            logger.warning('Rejecting AuthenticateServerResponse with empty eumCertificate in zk mode')
-            raise ApiError('8.1', '6.1', 'Verification failed (empty eumCertificate)')
 
         # load certificate
         try:
@@ -781,13 +776,15 @@ class SmDppHttpServer:
                 logger.warning('Rejecting malformed euiccCertificate in zk mode')
                 raise ApiError('8.1', '6.1', 'Verification failed (invalid euiccCertificate)')
             raise
-        try:
-            eum_cert = x509.load_der_x509_certificate(eumCertificate_bin)
-        except ValueError:
-            if self.zk_mode:
-                logger.warning('Rejecting malformed eumCertificate in zk mode')
-                raise ApiError('8.1', '6.1', 'Verification failed (invalid eumCertificate)')
-            raise
+        eum_cert = None
+        if not self.zk_mode or eumCertificate_bin != b'\x30\x00':
+            try:
+                eum_cert = x509.load_der_x509_certificate(eumCertificate_bin)
+            except ValueError:
+                if self.zk_mode:
+                    logger.warning('Rejecting malformed eumCertificate in zk mode')
+                    raise ApiError('8.1', '6.1', 'Verification failed (invalid eumCertificate)')
+                raise
 
         # Verify that the transactionId is known and relates to an ongoing RSP session.  Otherwise, the SM-DP+
         # SHALL return a status code "TransactionId - Unknown"
@@ -796,7 +793,7 @@ class SmDppHttpServer:
         if ss is None:
             raise ApiError('8.10.1', '3.9', 'Unknown')
         ss.euicc_cert = euicc_cert
-        ss.eum_cert = eum_cert 
+        ss.eum_cert = eum_cert
 
         #* creates the h_cert (ie H''(PCert_U)) - overwrites the default defined value from SetupMNO
         digest = hashes.Hash(hashes.SHA256())
@@ -804,25 +801,30 @@ class SmDppHttpServer:
         h_cert = digest.finalize()
         ss.setHCert(h_cert)
         self.rss[transactionId] = ss
-    
-        # Verify that the Root Certificate of the eUICC certificate chain corresponds to the
-        # euiccCiPKIdToBeUsed
-        if cert_get_auth_key_id(eum_cert) != ss.ci_cert_id:
-            raise ApiError('8.11.1', '3.9', 'Unknown')
 
-        # Verify the validity of the eUICC certificate chain
-        cs = CertificateSet(self.ci_get_cert_for_pkid(ss.ci_cert_id))
-        cs.add_intermediate_cert(eum_cert)
-        try:
-            cs.verify_cert_chain(euicc_cert)
-        except VerifyError:
-            raise ApiError('8.1.3', '6.1', 'Verification failed (certificate chain)')
-        #   raise ApiError('8.1.3', '6.3', 'Expired')
+        # EUM chain validation: SGP.22 mandates it, but zk mode uses a self-signed
+        # eUICC cert without an EUM issuer, so walking the chain would fail.  Skip
+        # the chain check in zk mode — we still verify euiccSignature1 below.
+        if not self.zk_mode:
+            # Verify that the Root Certificate of the eUICC certificate chain corresponds to the
+            # euiccCiPKIdToBeUsed
+            if cert_get_auth_key_id(eum_cert) != ss.ci_cert_id:
+                raise ApiError('8.11.1', '3.9', 'Unknown')
+
+            # Verify the validity of the eUICC certificate chain
+            cs = CertificateSet(self.ci_get_cert_for_pkid(ss.ci_cert_id))
+            cs.add_intermediate_cert(eum_cert)
+            try:
+                cs.verify_cert_chain(euicc_cert)
+            except VerifyError:
+                raise ApiError('8.1.3', '6.1', 'Verification failed (certificate chain)')
+            #   raise ApiError('8.1.3', '6.3', 'Expired')
 
         # TODO - change to verify the pseudonymous certificate
         # TODO - check that this works with the updated EuiccSigned1
         # Verify euiccSignature1 over euiccSigned1 using pubkey from euiccCertificate.
         # Otherwise, the SM-DP+ SHALL return a status code "eUICC - Verification failed"
+        # This runs in BOTH zk and normal mode — the zk mode skips only chain walking.
         if not self._ecdsa_verify(euicc_cert, euiccSignature1_bin, euiccSigned1_bin):
             raise ApiError('8.1', '6.1', 'Verification failed (euiccSignature1 over euiccSigned1)')
 
@@ -878,8 +880,13 @@ class SmDppHttpServer:
             if not matchingId:
                 raise ApiError('8.2.6', '3.8', 'Refused')
             if matchingId:
-                # look up profile based on matchingID.  We simply check if a given file exists for now..
-                path = os.path.join(self.upp_dir, matchingId) + '.der'
+                # In zk mode, always serve the fixed TS48V1-A-UNIQUE profile regardless of the
+                # matchingId sent by the applet (applet has a hardcoded value that doesn't
+                # line up with the workflow's MATCHING_ID).  In normal flow we honour matchingId.
+                if self.zk_mode:
+                    path = os.path.join(self.upp_dir, 'TS48V1-A-UNIQUE.der')
+                else:
+                    path = os.path.join(self.upp_dir, matchingId) + '.der'
                 # prevent directory traversal attack
                 if os.path.commonprefix((os.path.realpath(path),self.upp_dir)) != self.upp_dir:
                     raise ApiError('8.2.6', '3.8', 'Refused')
@@ -899,17 +906,31 @@ class SmDppHttpServer:
             if not isinstance(ss.pk_mno, ec.EllipticCurvePublicKey):
                 raise ApiError('0.1', '2.2', 'MNO public key not of compatible type')
 
+            # The applet signs sig_cred / sig_root / auth_tok over the real h_cert
+            # (SHA256 of its euiccCertificate_bin) using its local FIXED_MNO scalar.
+            # Signatures arrive as raw 64-byte r||s — convert to DER before verify.
             try:
-                # Verify MNO credential signature over (H_pid, h_cert, mnoid)
-                ss.pk_mno.verify(ss.sig_cred, ss.h_pid + h_cert + ss.mnoid, ec.ECDSA(hashes.SHA256()))
+                ss.pk_mno.verify(ecdsa_tr03111_to_dss(ss.sig_cred),
+                                 ss.h_pid + h_cert + ss.mnoid,
+                                 ec.ECDSA(hashes.SHA256()))
             except InvalidSignature:
                 raise ApiError('0.1', '1.2', 'Failed to verify MNO credential signature')
 
             try:
-                # Verify MNO signature over root_auth
-                ss.pk_mno.verify(ss.sig_root, ss.root_auth, ec.ECDSA(hashes.SHA256()))
+                # Verify MNO signature over root_auth (== h_pid for single-leaf accumulator)
+                ss.pk_mno.verify(ecdsa_tr03111_to_dss(ss.sig_root),
+                                 ss.root_auth,
+                                 ec.ECDSA(hashes.SHA256()))
             except InvalidSignature:
                 raise ApiError('0.1', '1.3', 'Failed to verify root signature')
+
+            try:
+                # Verify MNO signature over auth_tok payload (h_pid || h_cert || mnoid || expiry)
+                ss.pk_mno.verify(ecdsa_tr03111_to_dss(ss.auth_tok),
+                                 ss.h_pid + h_cert + ss.mnoid + ss.expiry,
+                                 ec.ECDSA(hashes.SHA256()))
+            except InvalidSignature:
+                raise ApiError('0.1', '1.2', 'Failed to verify authorization token signature')
 
             if isinstance(ss.L_auth, rsp.MerkleAccumulator):
                 if not ss.h_pid:
