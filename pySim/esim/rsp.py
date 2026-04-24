@@ -246,8 +246,8 @@ class MerkleAccumulator():
 
     def add(self, element: str):
         if element in self.leaves:
-            return 
-        leaf_hash = hash_fn(element.encode())
+            return
+        leaf_hash = bytes.fromhex(element)
         self.leaves[element] = leaf_hash
         self._compute_root()
 
@@ -285,7 +285,7 @@ class MerkleAccumulator():
     @staticmethod
     def verifyProof(element: str, proof: list, root: bytes) -> bool:
         """Verify membership proof for an element."""
-        current = hash_fn(element.encode())
+        current = bytes.fromhex(element)
         for sibling in proof:
             if current < sibling:
                 current = hash_fn(current + sibling)
