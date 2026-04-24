@@ -118,7 +118,7 @@ import argparse # noqa: E402
 import uuid # noqa: E402
 import os # noqa: E402
 import functools # noqa: E402
-from typing import Optional, Dict, List, Tuple # noqa: E402
+from typing import Optional, Dict, List # noqa: E402
 from pprint import pprint as pp # noqa: E402
 
 import datetime
@@ -570,158 +570,6 @@ class SmDppHttpServer:
         except InvalidSignature:
             return False
 
-    # @staticmethod
-    # def _parse_authenticate_response_ok_fields(auth_resp_ok_v: bytes) -> dict:
-    #     rawtag, _l, euicc_signed1_bin, remainder = bertlv_return_one_rawtlv(auth_resp_ok_v)
-    #     if rawtag != 0x30:
-    #         raise ValueError('Unexpected tag where EuiccSigned1 SEQUENCE was expected')
-
-    #     if not len(remainder):
-    #         raise ValueError('Missing euiccSignature1 after EuiccSigned1')
-    #     rawtag, _l, euicc_signature1_bin, remainder = bertlv_parse_one_rawtag(remainder)
-    #     if rawtag != 0x5f37:
-    #         raise ValueError('Unexpected tag where euiccSignature1 was expected')
-
-    #     if not len(remainder):
-    #         raise ValueError('Missing euiccCertificate after euiccSignature1')
-    #     rawtag, _l, euicc_certificate_bin, remainder = bertlv_return_one_rawtlv(remainder)
-    #     if rawtag != 0x30:
-    #         raise ValueError('Unexpected tag where euiccCertificate was expected')
-
-    #     if not len(remainder):
-    #         raise ValueError('Missing eumCertificate after euiccCertificate')
-    #     rawtag, _l, eum_certificate_bin, remainder = bertlv_return_one_rawtlv(remainder)
-    #     if rawtag != 0x30:
-    #         raise ValueError('Unexpected tag where eumCertificate was expected')
-    #     if len(remainder):
-    #         raise ValueError('Excess data after AuthenticateResponseOk')
-
-    #     return {
-    #         'euiccSigned1': rsp.asn1.decode('EuiccSigned1', euicc_signed1_bin),
-    #         'euiccSigned1_bin': euicc_signed1_bin,
-    #         'euiccSignature1': euicc_signature1_bin,
-    #         'euiccCertificate_bin': euicc_certificate_bin,
-    #         'eumCertificate_bin': eum_certificate_bin,
-    #     }
-
-    @staticmethod
-    def _parse_authenticate_server_response_zk(authenticate_server_resp_bin: bytes) -> Tuple[str, dict]:
-        """Parse BF38 without decoding embedded X.509 certificates via asn1tools.
-
-        This path is used only in zk mode so the normal flow remains untouched.
-        """
-        rawtag, _l, outer_v, remainder = bertlv_parse_one_rawtag(authenticate_server_resp_bin)
-        if len(remainder):
-            raise ValueError('Excess data at end of AuthenticateServerResponse')
-        if rawtag != 0xbf38:
-            raise ValueError('Unexpected outer tag: %s' % b2h(rawtag))
-
-        rawtag, _l, choice_v, remainder = bertlv_parse_one_rawtag(outer_v)
-        if len(remainder):
-            raise ValueError('Excess data after AuthenticateServerResponse choice')
-
-        if rawtag == 0xa1:
-            return ('authenticateResponseError',
-                    rsp.asn1.decode('AuthenticateResponseError', bytes(choice_v)))
-        if rawtag != 0xa0:
-            raise ValueError('Unexpected tag where CHOICE was expected')
-        rawtag, _l, euicc_signed1_bin, remainder = bertlv_return_one_rawtlv(choice_v)
-        if rawtag != 0x30:
-            raise ValueError('Unexpected tag where EuiccSigned1 SEQUENCE was expected')
-
-        rawtag, _l, euicc_signature1_bin, remainder = bertlv_parse_one_rawtag(remainder)
-        if rawtag != 0x5f37:
-            raise ValueError('Unexpected tag where euiccSignature1 was expected')
-
-        rawtag, _l, euicc_certificate_bin, remainder = bertlv_return_one_rawtlv(remainder)
-        if rawtag != 0x30:
-            raise ValueError('Unexpected tag where euiccCertificate was expected')
-
-        rawtag, _l, eum_certificate_bin, remainder = bertlv_return_one_rawtlv(remainder)
-        if rawtag != 0x30:
-            raise ValueError('Unexpected tag where eumCertificate was expected')
-        if len(remainder):
-            raise ValueError('Excess data after AuthenticateResponseOk')
-
-        return ('authenticateResponseOk', {
-            'euiccSigned1': rsp.asn1.decode('EuiccSigned1', euicc_signed1_bin),
-            'euiccSigned1_bin': euicc_signed1_bin,
-            'euiccSignature1': euicc_signature1_bin,
-            'euiccCertificate_bin': euicc_certificate_bin,
-            'eumCertificate_bin': eum_certificate_bin,
-        })
-
-    #     rawtag, _l, auth_resp_ok_v, remainder = bertlv_parse_one_rawtag(choice_v)
-    #     if rawtag != 0x30:
-    #         raise ValueError('Unexpected tag where AuthenticateResponseOk SEQUENCE was expected')
-
-    #     if len(remainder):
-    #         # Older applet builds encoded choice_v as:
-    #         #   euiccSigned1 SEQUENCE, euiccSignature1, euiccCertificate, eumCertificate
-    #         # instead of wrapping those fields in AuthenticateResponseOk SEQUENCE.
-    #         rawtag, _l, euicc_signed1_bin, remainder = bertlv_return_one_rawtlv(choice_v)
-    #         if rawtag != 0x30:
-    #             raise ValueError('Unexpected tag where legacy EuiccSigned1 SEQUENCE was expected')
-    #         fields = SmDppHttpServer._parse_authenticate_response_ok_fields(euicc_signed1_bin + remainder)
-    #     else:
-    #         fields = SmDppHttpServer._parse_authenticate_response_ok_fields(auth_resp_ok_v)
-
-    #     return ('authenticateResponseOk', fields)
-
-    @staticmethod
-    def _parse_prepare_download_response_manual(prepDownloadResp_bin: bytes) -> tuple:
-        """Manually parse PrepareDownloadResponse, working around asn1tools CHOICE ambiguity.
-        """
-        _, _, choice_v, _ = bertlv_parse_one_rawtag(prepDownloadResp_bin)
-        choice_v = bytes(choice_v)
-
-        first_byte = choice_v[0] if choice_v else 0
-
-        if first_byte == 0x80:
-            # PrepareDownloadResponseError: [0] txId | INTEGER downloadErrorCode
-            _, _, _txid, remainder = bertlv_parse_one_rawtag(choice_v)
-            _, _, err_bytes, _ = bertlv_parse_one_rawtag(bytes(remainder))
-            return ('downloadResponseError', int.from_bytes(bytes(err_bytes), 'big'))
-
-        if first_byte != 0x30:
-            raise ValueError('Unexpected PrepareDownloadResponse CHOICE first byte: 0x%02x' % first_byte)
-
-        # Get the SEQUENCE element (EUICCSigned2) as both full TLV and value-only bytes.
-        rawtag_seq, _, euicc_signed2_full_tlv, remainder = bertlv_return_one_rawtlv(choice_v)
-        euicc_signed2_full_tlv = bytes(euicc_signed2_full_tlv)
-        remainder = bytes(remainder)
-
-        if len(remainder) > 0:
-            # ZK applet legacy: first SEQUENCE IS EUICCSigned2; euiccSignature2 follows it.
-            rawtag_sig, _, euicc_sig2, _ = bertlv_parse_one_rawtag(remainder)
-            if rawtag_sig != 0x5f37:
-                raise ValueError('Expected euiccSignature2 tag 0x5f37, got 0x%x' % rawtag_sig)
-            _, _, euicc_signed2_value, _ = bertlv_parse_one_rawtag(euicc_signed2_full_tlv)
-        else:
-            # Standard (proper outer SEQUENCE wrapper): parse contents to distinguish OK vs Error.
-            _, _, inner_v, _ = bertlv_parse_one_rawtag(euicc_signed2_full_tlv)
-            inner_v = bytes(inner_v)
-
-            if inner_v[0] == 0x80:
-                # PrepareDownloadResponseError: outer SEQUENCE contains [0]txId + INTEGER errCode
-                _, _, _txid_v, err_remainder = bertlv_parse_one_rawtag(inner_v)
-                _, _, err_bytes, _ = bertlv_parse_one_rawtag(bytes(err_remainder))
-                return ('downloadResponseError', int.from_bytes(bytes(err_bytes), 'big'))
-
-            # Standard OK: inner SEQUENCE contains EUICCSigned2(30) + euiccSignature2(5f37)
-            rawtag2, _, euicc_signed2_full_tlv2, remainder2 = bertlv_return_one_rawtlv(inner_v)
-            euicc_signed2_full_tlv = bytes(euicc_signed2_full_tlv2)
-            rawtag_sig, _, euicc_sig2, _ = bertlv_parse_one_rawtag(bytes(remainder2))
-            _, _, euicc_signed2_value, _ = bertlv_parse_one_rawtag(euicc_signed2_full_tlv)
-
-        euicc_signed2_decoded = rsp.asn1.decode('EUICCSigned2', euicc_signed2_full_tlv)
-        return ('downloadResponseOk', {
-            'euiccSigned2': euicc_signed2_decoded,
-            'euiccSignature2': bytes(euicc_sig2),
-            'euiccSigned2ValueBytes': euicc_signed2_value,
-            'euiccSigned2Bin': euicc_signed2_full_tlv,
-        })
-
     @staticmethod
     def rsp_api_wrapper(func):
         """Wrapper that can be used as decorator in order to perform common REST API endpoint entry/exit
@@ -840,19 +688,8 @@ class SmDppHttpServer:
         """See ES9+ AuthenticateClient in SGP.22 Section 5.6.3"""
         transactionId = content['transactionId']
 
-        print(json.dumps(content, indent=2))
-
         authenticateServerResp_bin = b64decode(content['authenticateServerResponse'])
-        try:
-            if self.zk_mode:
-                authenticateServerResp = self._parse_authenticate_server_response_zk(authenticateServerResp_bin)
-            else:
-                authenticateServerResp = rsp.asn1.decode('AuthenticateServerResponse', authenticateServerResp_bin)
-        except Exception as e:
-            if self.zk_mode:
-                logger.warning('Rejecting malformed AuthenticateServerResponse in zk mode: %s', e)
-                raise ApiError('8.1', '6.1', 'Malformed AuthenticateServerResponse')
-            raise
+        authenticateServerResp = rsp.asn1.decode('AuthenticateServerResponse', authenticateServerResp_bin)
         logger.debug("Rx %s: %s" % authenticateServerResp)
         if authenticateServerResp[0] == 'authenticateResponseError':
             r_err = authenticateServerResp[1]
@@ -863,22 +700,12 @@ class SmDppHttpServer:
         # TODO - update on the LPA side 
         r_ok = authenticateServerResp[1]
         euiccSigned1 = r_ok['euiccSigned1']
-        if self.zk_mode:
-            euiccSigned1_bin = r_ok['euiccSigned1_bin']
-            euiccSignature1_bin = r_ok['euiccSignature1']
-            euiccCertificate_bin = r_ok['euiccCertificate_bin']
-            eumCertificate_bin = r_ok['eumCertificate_bin']
-        else:
-            euiccSigned1_bin = rsp.extract_euiccSigned1(authenticateServerResp_bin)
-            euiccSignature1_bin = r_ok['euiccSignature1']
-            euiccCertificate_dec = r_ok['euiccCertificate']
-            euiccCertificate_bin = rsp.asn1.encode('Certificate', euiccCertificate_dec)
-            eumCertificate_dec = r_ok['eumCertificate']
-            eumCertificate_bin = rsp.asn1.encode('Certificate', eumCertificate_dec)
-
-        if self.zk_mode and euiccCertificate_bin == b'\x30\x00':
-            logger.warning('Rejecting AuthenticateServerResponse with empty euiccCertificate in zk mode')
-            raise ApiError('8.1', '6.1', 'Verification failed (empty euiccCertificate)')
+        euiccSigned1_bin = rsp.extract_euiccSigned1(authenticateServerResp_bin)
+        euiccSignature1_bin = r_ok['euiccSignature1']
+        euiccCertificate_dec = r_ok['euiccCertificate']
+        euiccCertificate_bin = rsp.asn1.encode('Certificate', euiccCertificate_dec)
+        eumCertificate_dec = r_ok['eumCertificate']
+        eumCertificate_bin = rsp.asn1.encode('Certificate', eumCertificate_dec)
 
         # load certificate
         try:
@@ -888,15 +715,13 @@ class SmDppHttpServer:
                 logger.warning('Rejecting malformed euiccCertificate in zk mode')
                 raise ApiError('8.1', '6.1', 'Verification failed (invalid euiccCertificate)')
             raise
-        eum_cert = None
-        if not self.zk_mode or eumCertificate_bin != b'\x30\x00':
-            try:
-                eum_cert = x509.load_der_x509_certificate(eumCertificate_bin)
-            except ValueError:
-                if self.zk_mode:
-                    logger.warning('Rejecting malformed eumCertificate in zk mode')
-                    raise ApiError('8.1', '6.1', 'Verification failed (invalid eumCertificate)')
-                raise
+        try:
+            eum_cert = x509.load_der_x509_certificate(eumCertificate_bin)
+        except ValueError:
+            if self.zk_mode:
+                logger.warning('Rejecting malformed eumCertificate in zk mode')
+                raise ApiError('8.1', '6.1', 'Verification failed (invalid eumCertificate)')
+            raise
 
         # Verify that the transactionId is known and relates to an ongoing RSP session.  Otherwise, the SM-DP+
         # SHALL return a status code "TransactionId - Unknown"
@@ -992,13 +817,8 @@ class SmDppHttpServer:
             if not matchingId:
                 raise ApiError('8.2.6', '3.8', 'Refused')
             if matchingId:
-                # In zk mode, always serve the fixed TS48V1-A-UNIQUE profile regardless of the
-                # matchingId sent by the applet (applet has a hardcoded value that doesn't
-                # line up with the workflow's MATCHING_ID).  In normal flow we honour matchingId.
-                if self.zk_mode:
-                    path = os.path.join(self.upp_dir, 'TS48V1-A-UNIQUE.der')
-                else:
-                    path = os.path.join(self.upp_dir, matchingId) + '.der'
+                # look up profile based on matchingID.  We simply check if a given file exists for now..
+                path = os.path.join(self.upp_dir, matchingId) + '.der'
                 # prevent directory traversal attack
                 if os.path.commonprefix((os.path.realpath(path),self.upp_dir)) != self.upp_dir:
                     raise ApiError('8.2.6', '3.8', 'Refused')
@@ -1074,12 +894,7 @@ class SmDppHttpServer:
             }
         smdpSigned2_bin = rsp.asn1.encode('SmdpSigned2', smdpSigned2)
 
-        if self.zk_mode:
-            # The ZK applet uses a hardcoded TEST_SMDP_PUBLIC_KEY == dp_auth's public key
-            # and verifies only over smdpSigned2 (no euiccSignature1 concatenated).
-            ss.smdpSignature2_do = b'\x5f\x37\x40' + self.dp_auth.ecdsa_sign(smdpSigned2_bin)
-        else:
-            ss.smdpSignature2_do = b'\x5f\x37\x40' + self.dp_pb.ecdsa_sign(smdpSigned2_bin + b'\x5f\x37\x40' + euiccSignature1_bin)
+        ss.smdpSignature2_do = b'\x5f\x37\x40' + self.dp_pb.ecdsa_sign(smdpSigned2_bin + b'\x5f\x37\x40' + euiccSignature1_bin)
 
         # update non-volatile state with updated ss object
         self.rss[transactionId] = ss
@@ -1097,43 +912,26 @@ class SmDppHttpServer:
         """See ES9+ GetBoundProfilePackage SGP.22 Section 5.6.2"""
         transactionId = content['transactionId']
 
-        print(f"\n Content Response = {content}\n")
-
-
         # Verify that the received transactionId is known and relates to an ongoing RSP session
         ss = self.rss.get(transactionId, None)
         if not ss:
             raise ApiError('8.10.1', '3.9', 'The RSP session identified by the TransactionID is unknown')
 
         prepDownloadResp_bin = b64decode(content['prepareDownloadResponse'])
-        print(f"\n Prepare Download Resp Bin = {prepDownloadResp_bin} \n")
         prepDownloadResp = rsp.asn1.decode('PrepareDownloadResponse', prepDownloadResp_bin)
-        print(f"\n Prepare Download Resp Decoded = {prepDownloadResp} \n")
-        logger.debug("Rx PrepareDownloadResponse: %s" % (prepDownloadResp,))
-
-        if prepDownloadResp[0] is None:
-            # asn1tools can't distinguish the CHOICE alternatives (both are SEQUENCE);
-            # fall back to manual TLV parsing.
-            prepDownloadResp = SmDppHttpServer._parse_prepare_download_response_manual(prepDownloadResp_bin)
+        logger.debug("Rx %s: %s" % prepDownloadResp)
 
         if prepDownloadResp[0] == 'downloadResponseError':
             err_code = prepDownloadResp[1]
             raise ApiError('8.1', '6.1', 'PrepareDownload failed: downloadErrorCode=%s' % err_code)
 
         r_ok = prepDownloadResp[1]
-        euiccSigned2 = r_ok['euiccSigned2']
-        euiccSignature2 = r_ok['euiccSignature2']
 
-        # Verify euiccSignature2. The ZK applet signs only over the EUICCSigned2 SEQUENCE
-        # value bytes (no smdpSignature2_do concatenated), so the verification differs by mode.
-        if self.zk_mode:
-            euicc_signed2_verify_data = r_ok['euiccSigned2ValueBytes']
-            if not self._ecdsa_verify(ss.euicc_cert, euiccSignature2, euicc_signed2_verify_data):
-                raise ApiError('8.1', '6.1', 'eUICC signature (euiccSignature2) is invalid')
-        else:
-            euiccSigned2_bin = rsp.extract_euiccSigned2(prepDownloadResp_bin)
-            if not self._ecdsa_verify(ss.euicc_cert, euiccSignature2, euiccSigned2_bin + ss.smdpSignature2_do):
-                raise ApiError('8.1', '6.1', 'eUICC signature is invalid')
+        # Verify the euiccSignature2 computed over euiccSigned2 and smdpSignature2 using the PK.EUICC.SIG attached to the ongoing RSP session
+        euiccSigned2 = r_ok['euiccSigned2']
+        euiccSigned2_bin = rsp.extract_euiccSigned2(prepDownloadResp_bin)
+        if not self._ecdsa_verify(ss.euicc_cert, r_ok['euiccSignature2'], euiccSigned2_bin + ss.smdpSignature2_do):
+            raise ApiError('8.1', '6.1', 'eUICC signature is invalid')
 
         # not in spec: Verify that signed TransactionID is outer transaction ID
         if h2b(transactionId) != euiccSigned2['transactionId']:
@@ -1160,10 +958,7 @@ class SmDppHttpServer:
         logger.debug("shared_secret: %s" % b2h(ss.shared_secret))
 
         #  Perform actual protection + binding of profile package (or return  pre-bound one)
-        # In ZK mode, the applet sends a hardcoded matchingId that does not correspond to any
-        # UPP file; use the same base profile that initiateAuthentication loaded (TS48V1-A-UNIQUE).
-        upp_name = 'zkesimTest' if self.zk_mode else ss.matchingId
-        with open(os.path.join(self.upp_dir, upp_name)+'.der', 'rb') as f:
+        with open(os.path.join(self.upp_dir, ss.matchingId)+'.der', 'rb') as f:
             upp = UnprotectedProfilePackage.from_der(f.read(), metadata=ss.profileMetadata)
             # HACK: Use empty PPP as we're still debugging the configureISDP step, and we want to avoid
             # cluttering the log with stuff happening after the failure
@@ -1275,12 +1070,14 @@ class SmDppHttpServer:
         if not self._ecdsa_verify(ss.euicc_cert, cancelSessionResponseOk['euiccCancelSessionSignature'], ecsr_bin):
             raise ApiError('8.1', '6.1', 'eUICC signature is invalid')
 
-        # Verify that the received smdpOid corresponds to the one in SM-DP+ CERT.DPauth.SIG.
-        # The SM-DP+ OID lives in the SAN as an OtherName type_id, not as the extension OID itself.
+        # Verify that the received smdpOid corresponds to one advertised in
+        # CERT.DPauth.SIG SubjectAltName.  Depending on cert profile/tooling,
+        # this may appear either as OtherName(type_id=...) or RegisteredID.
         subj_alt_name = self.dp_auth.get_subject_alt_name()
-        # if x509.ObjectIdentifier(ecsr['smdpOid']) != subj_alt_name.oid:
         smdp_oid = x509.ObjectIdentifier(ecsr['smdpOid'])
-        if not any(on.type_id == smdp_oid for on in subj_alt_name.get_values_for_type(x509.OtherName)):
+        other_name_oids = [on.type_id for on in subj_alt_name.get_values_for_type(x509.OtherName)]
+        registered_ids = subj_alt_name.get_values_for_type(x509.RegisteredID)
+        if smdp_oid not in other_name_oids and smdp_oid not in registered_ids:
             raise ApiError('8.8', '3.10', 'The provided SM-DP+ OID is invalid.')
 
         if ecsr['transactionId'] != h2b(transactionId):
