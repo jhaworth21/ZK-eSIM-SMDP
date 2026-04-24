@@ -966,20 +966,20 @@ class SmDppHttpServer:
         if False:
             # Use random keys
             bpp = BoundProfilePackage.from_upp(upp)
+        elif self.zk_mode:
+            from pySim.esim.bsp import bsp_key_derivation
+            # bsp_key_derivation() returns (s_enc, s_mac, initial_mcv).
+            s_enc, s_mac, initial_mcv = bsp_key_derivation(
+                ss.shared_secret,
+                key_type=0x88,
+                key_length=16,
+                host_id=ss.host_id,
+                eid=h2b(ss.eid),
+            )
+            ppp = ProtectedProfilePackage.from_upp(upp, BspInstance(s_enc, s_mac, initial_mcv))
+            bpp = BoundProfilePackage.from_ppp(ppp)
         else:
-            # Use session keys
-            if self.zk_mode:
-                from pySim.esim.bsp import bsp_key_derivation
-                initial_mcv, s_enc, s_mac = bsp_key_derivation(
-                    ss.shared_secret,
-                    key_type=0x88,
-                    key_length=16,
-                    host_id=ss.host_id,
-                    eid=h2b(ss.eid),
-                )
-                ppp = ProtectedProfilePackage.from_upp(upp, BspInstance(s_enc, s_mac, initial_mcv))
-            else:
-                ppp = ProtectedProfilePackage.from_upp(upp, BspInstance(b'\x00'*16, b'\x11'*16, b'\x22'*16))
+            ppp = ProtectedProfilePackage.from_upp(upp, BspInstance(b'\x00'*16, b'\x11'*16, b'\x22'*16))
             bpp = BoundProfilePackage.from_ppp(ppp)
 
         # update non-volatile state with updated ss object
