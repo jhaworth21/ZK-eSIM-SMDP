@@ -105,7 +105,6 @@ def fix_asn1_oid_decoding():
 
 fix_asn1_oid_decoding()
 
-from cryptography.hazmat.primitives.asymmetric.utils import encode_dss_signature # noqa: E402
 from cryptography import x509 # noqa: E402
 from cryptography.exceptions import InvalidSignature # noqa: E402
 from cryptography.hazmat.primitives import hashes # noqa: E402
@@ -133,6 +132,7 @@ from osmocom.tlv import bertlv_parse_one_rawtag, bertlv_return_one_rawtlv # noqa
 import pySim.esim.rsp as rsp # noqa: E402
 from pySim.esim import saip, PMO # noqa: E402
 from pySim.esim.es8p import ProfileMetadata,UnprotectedProfilePackage,ProtectedProfilePackage,BoundProfilePackage,BspInstance # noqa: E402
+from pySim.esim.zk_utils import deserialize_proof, ecdsa_tr03111_to_dss, hash_fn, serialize_proof # noqa: E402
 from pySim.esim.x509_cert import oid, cert_policy_has_oid, cert_get_auth_key_id # noqa: E402
 from pySim.esim.x509_cert import CertAndPrivkey, CertificateSet, cert_get_subject_key_id, VerifyError # noqa: E402
 
@@ -173,7 +173,7 @@ FIXED_TEST_EID = b"89049032000000000000012345678901"
 FIXED_EXPIRY = b"4102444800"
 FIXED_MNOID = b"MNO_id"
 FIXED_H_CERT_STUB = b"\x30\x00"
-FIXED_MNO_PRIVATE_SCALAR = int("1f1e1d1c1b1a19181716151413121110ffeeddccbbaa99887766554433221100", 16)
+FIXED_MNO_PUBLIC_KEY = bytes.fromhex("040E042F54B8687E479C41A84CD007B13A5F7D5F6ACD8E90AF58F0C85EADCB67F613D125A6409703254ADC1C7BC423571C9914A5A45F61241C0E73431654BD4C75")
 AUTH_TOKEN_VALIDITY_SECONDS = 3600
 
 
@@ -191,8 +191,8 @@ def decode_expiry(expiry_raw: bytes) -> datetime.datetime:
 
 
 def setupMNOValues(ss):
-    # ZK test vectors: pk_mno is shared with the applet (both hold the same
-    # FIXED_MNO_PRIVATE_SCALAR).  The applet signs sig_cred / sig_root / auth_tok
+    # ZK test vectors: pk_mno is shared with the applet and MNO server.
+    # The applet signs sig_cred / sig_root / auth_tok
     # at install time using the real h_cert from its self-signed euiccCertificate;
     # the SM-DP+ side merely verifies those signatures in authenticateClient.
     # We still set h_pid / L_auth here so the accumulator inclusion proof matches.
@@ -204,9 +204,7 @@ def setupMNOValues(ss):
     h_pid = hash_fn(pid)
     ss.h_pid = h_pid
 
-    sk_mno = ec.derive_private_key(FIXED_MNO_PRIVATE_SCALAR, ec.SECP256R1())
-    pk_mno = sk_mno.public_key()
-    ss.pk_mno = pk_mno
+    ss.pk_mno = ec.EllipticCurvePublicKey.from_encoded_point(ec.SECP256R1(), FIXED_MNO_PUBLIC_KEY)
 
     # Single-leaf accumulator: root == h_pid, proof is empty.
     L_auth = rsp.MerkleAccumulator()
@@ -232,29 +230,6 @@ def setupMNOValues(ss):
     ss.auth_tok = None
 
     return ss
-
-def hash_fn(input):
-    digest = hashes.Hash(hashes.SHA256())
-    digest.update(input)
-    return digest.finalize()
-
-
-def serialize_proof(proof):
-    if not proof:
-        return b''
-    out = b''
-    for sibling in proof:
-        out += sibling
-    return out
-
-
-def deserialize_proof(blob: bytes):
-    if not blob:
-        return []
-    if len(blob) % 32 != 0:
-        return []
-    return [blob[i:i+32] for i in range(0, len(blob), 32)]
-
 
 def b64encode2str(req: bytes) -> str:
     """Encode given input bytes as base64 and return result as string."""
@@ -451,14 +426,6 @@ def build_resp_header(js: dict, status: str = 'Executed-Success', status_code_da
         js['header']['functionExecutionStatus']['statusCodeData'] = status_code_data
 
 
-def ecdsa_tr03111_to_dss(sig: bytes) -> bytes:
-    """convert an ECDSA signature from BSI TR-03111 format to DER: first get long integers; then encode those."""
-    assert len(sig) == 64
-    r = int.from_bytes(sig[0:32], 'big')
-    s = int.from_bytes(sig[32:32*2], 'big')
-    return encode_dss_signature(r, s)
-
-
 class ApiError(Exception):
     def __init__(self, subject_code: str, reason_code: str, message: Optional[str] = None,
                  subject_id: Optional[str] = None):
@@ -553,6 +520,7 @@ class SmDppHttpServer:
             db_path = os.path.join(DATA_DIR, f"sm-dp-sessions-{session_db_suffix}")
             self.rss = rsp.RspSessionStore(filename=db_path, in_memory=False)
             logger.info(f"Using file-based session storage: {db_path}")
+        self._pending_orders = {}
 
     @app.handle_errors(ApiError)
     def handle_apierror(self, request: IRequest, failure):
@@ -988,6 +956,81 @@ class SmDppHttpServer:
             'transactionId': transactionId,
             'boundProfilePackage': b64encode2str(bpp.encode(ss, self.dp_pb)),
         }
+
+    @app.route('/gsma/rsp2/es2plus/downloadOrder', methods=['POST'])
+    @rsp_api_wrapper
+    def downloadOrder(self, request: IRequest, content: dict) -> dict:
+        eid = content.get('eid')
+        iccid = content.get('iccid') or self._allocate_zk_iccid(eid)
+        self._pending_orders[iccid] = {
+            'eid': eid,
+            'state': 'ordered',
+            'profileType': content.get('profileType')
+        }
+        return {'iccid': iccid}
+
+    @app.route('/gsma/rsp2/es2plus/confirmOrder', methods=['POST'])
+    @rsp_api_wrapper
+    def confirmOrder(self, request: IRequest, content: dict) -> dict:
+        iccid = content['iccid']
+        order = self._pending_orders.get(iccid)
+        if order is None:
+            raise ApiError('8.2.6', '3.8', 'Refused')
+
+        matching_id = content.get('matchingId') or self._allocate_matching_id(iccid, order.get('eid'))
+        order['matchingId'] = matching_id
+        order['state'] = 'confirmed'
+        self._ensure_upp_for_matching_id(matching_id)
+        return {
+            'eid': order.get('eid'),
+            'matchingId': matching_id,
+            'smdpAddress': self.server_hostname
+        }
+
+    @app.route('/gsma/rsp2/es2plus/releaseProfile', methods=['POST'])
+    @rsp_api_wrapper
+    def releaseProfile(self, request: IRequest, content: dict) -> dict:
+        iccid = content['iccid']
+        if iccid in self._pending_orders:
+            self._pending_orders[iccid]['state'] = 'released'
+        return {}
+
+    def _allocate_zk_iccid(self, eid: Optional[str]) -> str:
+        digest = hash_fn((eid or FIXED_TEST_EID.decode('ascii')).encode('ascii')).hex()
+        digits = ''.join(c for c in digest if c.isdigit())
+        return ('89049032' + digits + '0000000000')[:18]
+
+    def _allocate_matching_id(self, iccid: str, eid: Optional[str]) -> str:
+        digest = hash_fn((iccid + (eid or '')).encode('ascii')).hex().upper()
+        return 'ZK' + digest[:14]
+
+    def _ensure_upp_for_matching_id(self, matching_id: str) -> None:
+        target = os.path.join(self.upp_dir, matching_id) + '.der'
+        if os.path.exists(target):
+            return
+
+        candidates = ['zkesimTest.der', 'algtestJc305.der', 'TS48V1-A-UNIQUE.der']
+        source = None
+        for candidate in candidates:
+            path = os.path.join(self.upp_dir, candidate)
+            if os.path.isfile(path):
+                source = path
+                break
+        if source is None:
+            for name in os.listdir(self.upp_dir):
+                if name.endswith('.der'):
+                    source = os.path.join(self.upp_dir, name)
+                    break
+        if source is None:
+            raise ApiError('8.2.6', '3.8', 'No UPP available for ordered profile')
+
+        try:
+            os.symlink(os.path.basename(source), target)
+        except OSError:
+            with open(source, 'rb') as src:
+                data = src.read()
+            with open(target, 'wb') as dst:
+                dst.write(data)
 
     @app.route('/gsma/rsp2/es9plus/handleNotification', methods=['POST'])
     @rsp_api_wrapper
