@@ -860,4 +860,66 @@ EventEntries ::= SEQUENCE {
     rspServerAddress UTF8String
 }
  
+-- Definition of data objects for ZK-eSIM Phase 1 ZKProfileRequest
+-- Alg. 4 in the ZK-eSIM spec.  The LPA passes the MNO's challenge (N_S) into
+-- the eUICC; the eUICC returns the ZK statement x, the pseudonym certificate
+-- PCert_U, and a Schnorr proof-of-knowledge of sk_U bound to x.
+
+ZKProfileRequest ::= [66] SEQUENCE { -- Tag 'BF42'
+    mnoChallenge Octet16            -- N_S: MNO nonce; pk_MNO/pk_LEA/mnoid are Phase-0 constants
+}
+
+ZKProfileResponse ::= [66] CHOICE { -- Tag 'BF42'
+    zkProfileResponseOk  ZKProfileResponseOk,
+    zkProfileResponseError ZKProfileResponseError
+}
+
+ZKProfileResponseOk ::= SEQUENCE {
+    zkStatement ZKStatement,
+    pcertU Certificate,
+    zkProof [APPLICATION 55] OCTET STRING  -- Schnorr (R||s): 65+32=97 bytes, tag '5F37'
+}
+
+ZKStatement ::= SEQUENCE {
+    pkMno        [0] OCTET STRING,   -- pk_MNO (65 B, uncompressed P-256 point)
+    pkLea        [1] OCTET STRING,   -- pk_LEA (65 B)
+    pkU          [2] OCTET STRING,   -- pk_U (eUICC public key, 65 B)
+    mnoChallenge [3] Octet16,        -- N_S (16 B)
+    pid          [4] Octet32,        -- PRF_{K_pid}(EID) (32 B)
+    encEid       [5] OCTET STRING,   -- ECIES.Enc_{pk_LEA}(EID;r) = ePK(65)||ct(16) = 81 B
+    hSigmaEid    [6] Octet32         -- SHA-256(σ_EID) — blind-Schnorr credential binding (32 B)
+}
+
+ZKProfileResponseError ::= SEQUENCE {
+    errorCode ZKProfileErrorCode
+}
+
+ZKProfileErrorCode ::= INTEGER {
+    invalidChallenge(1),
+    cryptoError(2),
+    undefinedError(127)
+}
+
+-- Definition of data objects for ZK-eSIM Phase 2 SetEligibilityData
+-- Alg. 5 step 21: the MNO delivers issued credentials to the eUICC so that the
+-- subsequent SGP.22 AuthenticateServer flow carries them verbatim in BF38.
+
+SetEligibilityDataRequest ::= [67] SEQUENCE { -- Tag 'BF43'
+    eligibilityData EligibilityData
+}
+
+SetEligibilityDataResponse ::= [67] CHOICE { -- Tag 'BF43'
+    setEligibilityOk SetEligibilityOk,
+    setEligibilityError SetEligibilityErrorCode
+}
+
+SetEligibilityOk ::= SEQUENCE {}
+
+SetEligibilityErrorCode ::= INTEGER {
+    invalidFormat(1),
+    lengthMismatch(2),
+    notAllowed(3),
+    undefinedError(127)
+}
+
 END

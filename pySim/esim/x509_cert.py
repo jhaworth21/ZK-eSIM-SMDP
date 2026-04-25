@@ -38,10 +38,13 @@ def cert_get_subject_key_id(cert: x509.Certificate) -> bytes:
     ski_ext = cert.extensions.get_extension_for_class(x509.SubjectKeyIdentifier).value
     return ski_ext.key_identifier
 
-def cert_get_auth_key_id(cert: x509.Certificate) -> bytes:
-    """Obtain the authority key identifier of the given cert object (as raw bytes)."""
-    aki_ext = cert.extensions.get_extension_for_class(x509.AuthorityKeyIdentifier).value
-    return aki_ext.key_identifier
+def cert_get_auth_key_id(cert: x509.Certificate):
+    """Obtain the authority key identifier of the given cert object (as raw bytes), or None if absent."""
+    try:
+        aki_ext = cert.extensions.get_extension_for_class(x509.AuthorityKeyIdentifier).value
+        return aki_ext.key_identifier
+    except x509.ExtensionNotFound:
+        return None
 
 def cert_policy_has_oid(cert: x509.Certificate, match_oid: x509.ObjectIdentifier) -> bool:
     """Determine if given certificate has a certificatePolicy extension of matching OID."""
