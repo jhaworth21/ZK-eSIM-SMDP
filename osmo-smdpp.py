@@ -132,7 +132,7 @@ from osmocom.tlv import bertlv_parse_one_rawtag, bertlv_return_one_rawtlv # noqa
 import pySim.esim.rsp as rsp # noqa: E402
 from pySim.esim import saip, PMO # noqa: E402
 from pySim.esim.es8p import ProfileMetadata,UnprotectedProfilePackage,ProtectedProfilePackage,BoundProfilePackage,BspInstance # noqa: E402
-from pySim.esim.zk_utils import deserialize_proof, ecdsa_tr03111_to_dss, hash_fn, serialize_proof # noqa: E402
+from pySim.esim.zk_utils import deserialize_proof, ecdsa_tr03111_to_dss, extract_pcert_from_bf, hash_fn, serialize_proof # noqa: E402
 from pySim.esim.x509_cert import oid, cert_policy_has_oid, cert_get_auth_key_id # noqa: E402
 from pySim.esim.x509_cert import CertAndPrivkey, CertificateSet, cert_get_subject_key_id, VerifyError # noqa: E402
 
@@ -700,10 +700,12 @@ class SmDppHttpServer:
         ss.euicc_cert = euicc_cert
         ss.eum_cert = eum_cert
 
-        #* creates the h_cert (ie H''(PCert_U)) - overwrites the default defined value from SetupMNO
-        digest = hashes.Hash(hashes.SHA256())
-        digest.update(euiccCertificate_bin)
-        h_cert = digest.finalize()
+        #* h_cert (ie H''(PCert_U)) — must hash the EXACT on-wire DER bytes of
+        # the eUICC certificate.  asn1tools encode/decode is not guaranteed to
+        # round-trip byte-for-byte for the applet's hand-rolled cert, and the
+        # MNO does the same raw-byte extraction on its BF42 path, so we use
+        # the same helper here to keep h_cert consistent across both servers.
+        h_cert = hash_fn(extract_pcert_from_bf(authenticateServerResp_bin, 0xbf38))
         ss.setHCert(h_cert)
         self.rss[transactionId] = ss
 

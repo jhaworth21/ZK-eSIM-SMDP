@@ -2,6 +2,7 @@
 
 import argparse
 import base64
+import functools
 import json
 import logging
 import os
@@ -20,9 +21,17 @@ from cryptography.hazmat.primitives.serialization import Encoding, ParameterForm
 from klein import Klein
 from twisted.web.iweb import IRequest
 
+from osmocom.utils import b2h
+
 import pySim.esim.rsp as rsp
+from pySim.esim import saip
 from pySim.esim.es2p import Es2pApiClient
-from pySim.esim.zk_utils import ecdsa_der_to_tr03111, hash_fn, serialize_proof
+from pySim.esim.zk_utils import (
+    ecdsa_der_to_tr03111,
+    extract_pcert_from_bf,
+    hash_fn,
+    serialize_proof,
+)
 
 
 DATA_DIR = './smdpp-data'
@@ -31,6 +40,23 @@ FIXED_MNO_PRIVATE_SCALAR = int('1f1e1d1c1b1a19181716151413121110ffeeddccbbaa9988
 FIXED_LEA_PRIVATE_SCALAR = int('0a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20212223242526272829', 16)
 FIXED_MNOID = b'MNO_id'
 FIXED_EXPIRY = b'4102444800'
+FIXED_ZK_MATCHING_ID = 'TS48V1-A-UNIQUE'
+FIXED_ZK_UPP = FIXED_ZK_MATCHING_ID + '.der'
+# The SMDP+ TLS leaf cert is signed by the test "Certificate Issuer" (CI),
+# so trusting that CI's cert is what lets `requests` verify the chain.
+DEFAULT_SMDP_CACERT = os.path.join(DATA_DIR, 'certs', 'CertificateIssuer', 'CERT_CI_ECDSA_NIST.pem')
+
+
+def load_zk_profile_iccid(data_dir: str) -> str:
+    """Read the ICCID out of the fixed test profile UPP so the MNO can hand
+    it to the SM-DP+ as the ES2+ DownloadOrder iccid (the schema rejects
+    None / placeholder values).  Returns the decimal-only form with the
+    BCD F padding stripped."""
+    path = os.path.join(data_dir, 'upp', FIXED_ZK_UPP)
+    with open(path, 'rb') as f:
+        pes = saip.ProfileElementSequence.from_der(f.read())
+    raw = b2h(pes.get_pe_for_type('header').decoded['iccid'])
+    return raw.rstrip('fF')
 
 
 logger = logging.getLogger(__name__)
@@ -51,7 +77,7 @@ def public_point(private_key) -> bytes:
 class MnoServer:
     app = Klein()
 
-    def __init__(self, smdp_url: str, data_dir: str):
+    def __init__(self, smdp_url: str, data_dir: str, smdp_cacert: Optional[str] = None):
         self.smdp_url = smdp_url
         self.data_dir = data_dir
         self.requests = {}
@@ -60,10 +86,23 @@ class MnoServer:
         self.pk_mno_point = public_point(self.sk_mno)
         self.sk_lea = ec.derive_private_key(FIXED_LEA_PRIVATE_SCALAR, ec.SECP256R1())
         self.pk_lea_point = public_point(self.sk_lea)
-        self.es2p = Es2pApiClient(url_prefix=smdp_url, func_req_id='mno-test')
+        # The SMDP+ uses a self-signed test cert; tell the underlying
+        # `requests.Session` to trust it (or pass an empty string / None
+        # to disable verification entirely).
+        self.es2p = Es2pApiClient(url_prefix=smdp_url, func_req_id='mno-test',
+                                  server_cert_verify=smdp_cacert)
+        if smdp_cacert is False or smdp_cacert == '':
+            # Allow callers to explicitly disable verification by passing
+            # an empty string; requests treats `verify=False` as off.
+            self.es2p.session.verify = False
+        self.zk_profile_iccid = load_zk_profile_iccid(data_dir)
+        self.zk_matching_id = FIXED_ZK_MATCHING_ID
+        logger.info('MNO bound to fixed ZK profile %s (iccid=%s); SMDP+ cacert=%s',
+                    self.zk_matching_id, self.zk_profile_iccid, smdp_cacert)
 
     @staticmethod
     def json_endpoint(func):
+        @functools.wraps(func)
         def wrapper(self, request: IRequest):
             request.setHeader('Content-Type', 'application/json;charset=UTF-8')
             raw = request.content.read()
@@ -111,7 +150,11 @@ class MnoServer:
 
         ok = zk_resp[1]
         stmt = ok['zkStatement']
-        pcert_der = rsp.asn1.encode('Certificate', ok['pcertU'])
+        # h_cert MUST be computed over the exact on-wire DER bytes of the
+        # eUICC cert so the SMDP+ verify side (which extracts from BF38 the
+        # same way) produces an identical hash.  asn1tools encode/decode is
+        # not guaranteed to round-trip byte-for-byte for a hand-rolled cert.
+        pcert_der = extract_pcert_from_bf(zk_resp_bin, 0xbf42)
         proof = ok['zkProof']
 
         if stmt['mnoChallenge'] != state['mnoChallenge']:
@@ -140,16 +183,19 @@ class MnoServer:
         root_auth = bytes(l_auth.get_root())
         pi_inc = serialize_proof(l_auth.generateProof(h_pid_hex))
 
+        # ICCID and matchingId are pinned to the fixed test profile
+        # smdpp-data/upp/TS48V1-A-UNIQUE.der so the SMDP+ side can serve
+        # the same UPP every time without inventing identifiers.
         dl_order = self.es2p.call_downloadOrder({
             'eid': eid,
-            'iccid': None,
+            'iccid': self.zk_profile_iccid,
             'profileType': 'ZK_TEST'
         })
         iccid = dl_order['iccid']
         conf = self.es2p.call_confirmOrder({
             'iccid': iccid,
             'eid': eid,
-            'matchingId': content.get('matchingId'),
+            'matchingId': content.get('matchingId') or self.zk_matching_id,
             'releaseFlag': True
         })
 
@@ -204,10 +250,16 @@ def main():
     parser.add_argument('--port', type=int, default=DEFAULT_MNO_PORT)
     parser.add_argument('--smdp-url', default='https://testsmdpplus1.example.com:8000')
     parser.add_argument('--data-dir', default=DATA_DIR)
+    parser.add_argument('--smdp-cacert', default=DEFAULT_SMDP_CACERT,
+                        help='PEM the MNO trusts when calling the SMDP+ ES2+ endpoints '
+                             '(use --smdp-no-verify to disable verification)')
+    parser.add_argument('--smdp-no-verify', action='store_true', default=False,
+                        help='disable TLS verification on outbound SMDP+ ES2+ calls')
     parser.add_argument('--nossl', action='store_true', default=False)
     args = parser.parse_args()
 
-    server = MnoServer(args.smdp_url, args.data_dir)
+    smdp_cacert = '' if args.smdp_no_verify else args.smdp_cacert
+    server = MnoServer(args.smdp_url, args.data_dir, smdp_cacert=smdp_cacert)
     if args.nossl:
         server.app.run(args.host, args.port)
         return
