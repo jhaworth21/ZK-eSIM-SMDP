@@ -30,6 +30,8 @@ from pySim.esim.zk_utils import (
     ecdsa_der_to_tr03111,
     extract_pcert_from_bf,
     hash_fn,
+    parse_zk_profile_response,
+    schnorr_verify_p256,
     serialize_proof,
 )
 
@@ -42,6 +44,18 @@ FIXED_MNOID = b'MNO_id'
 FIXED_EXPIRY = b'4102444800'
 FIXED_ZK_MATCHING_ID = 'TS48V1-A-UNIQUE'
 FIXED_ZK_UPP = FIXED_ZK_MATCHING_ID + '.der'
+P256_ORDER = 0xFFFFFFFF00000000FFFFFFFFFFFFFFFFBCE6FAADA7179E84F3B9CAC2FC632551
+FIXED_DEVICE_W = bytes([
+    0x04, 0x1D, 0xD0, 0x96, 0xDE, 0x35, 0x6A, 0x2F,
+    0x4F, 0xEC, 0xC2, 0x41, 0x1F, 0x0C, 0xD0, 0x60,
+    0x37, 0x53, 0xED, 0x27, 0x2E, 0x41, 0xCC, 0x2A,
+    0xDD, 0x4A, 0x45, 0x71, 0x35, 0x28, 0xC2, 0x50,
+    0xFE, 0xFF, 0x72, 0x4F, 0x2D, 0xAA, 0xC5, 0x70,
+    0xCE, 0x7F, 0x71, 0xE7, 0x51, 0x01, 0x46, 0x8D,
+    0xBC, 0xD5, 0xAE, 0xD6, 0xBB, 0xB8, 0xA3, 0xAC,
+    0x3C, 0x1C, 0x36, 0xEE, 0x6D, 0xEA, 0xAF, 0x4D,
+    0xC1,
+])
 # The SMDP+ TLS leaf cert is signed by the test "Certificate Issuer" (CI),
 # so trusting that CI's cert is what lets `requests` verify the chain.
 DEFAULT_SMDP_CACERT = os.path.join(DATA_DIR, 'certs', 'CertificateIssuer', 'CERT_CI_ECDSA_NIST.pem')
@@ -74,6 +88,14 @@ def public_point(private_key) -> bytes:
     return private_key.public_key().public_bytes(Encoding.X962, PublicFormat.UncompressedPoint)
 
 
+def get_field(content: dict, *names: str) -> str:
+    for name in names:
+        value = content.get(name)
+        if value is not None:
+            return value
+    raise ValueError('missing ' + '/'.join(names))
+
+
 class MnoServer:
     app = Klein()
 
@@ -81,6 +103,8 @@ class MnoServer:
         self.smdp_url = smdp_url
         self.data_dir = data_dir
         self.requests = {}
+        self.phase0_sessions = {}
+        self.l_auth = rsp.MerkleAccumulator()
         self.sk_mno = ec.derive_private_key(FIXED_MNO_PRIVATE_SCALAR, ec.SECP256R1())
         self.pk_mno = self.sk_mno.public_key()
         self.pk_mno_point = public_point(self.sk_mno)
@@ -135,6 +159,59 @@ class MnoServer:
             'expiry': FIXED_EXPIRY.decode('ascii')
         }
 
+    @app.route('/zk-esim/v1/registerChallenge', methods=['POST'])
+    @json_endpoint
+    def register_challenge(self, request: IRequest, content: dict) -> dict:
+        r_mno = int.from_bytes(os.urandom(32), 'big') % P256_ORDER
+        if r_mno == 0:
+            r_mno = 1
+        mno_nonce_commitment = ec.derive_private_key(r_mno, ec.SECP256R1()).public_key().public_bytes(
+            Encoding.X962, PublicFormat.UncompressedPoint)
+        request_id = uuid.uuid4().hex
+        self.phase0_sessions[request_id] = {'r_mno': r_mno, 'complete': False}
+        commitment_b64 = b64(mno_nonce_commitment)
+        return {
+            'requestId': request_id,
+            'mnoNonceCommitment': commitment_b64,
+            # Compatibility alias for older workflow prototypes.
+            'rMno': commitment_b64,
+        }
+
+    @app.route('/zk-esim/v1/registerCredential', methods=['POST'])
+    @json_endpoint
+    def register_credential(self, request: IRequest, content: dict) -> dict:
+        request_id = content.get('requestId')
+        if not request_id:
+            raise ValueError('missing requestId')
+        state = self.phase0_sessions.get(request_id)
+        if state is None:
+            raise ValueError('unknown Phase 0 requestId')
+        if state.get('complete'):
+            raise ValueError('Phase 0 requestId already consumed')
+
+        blinded_challenge = unb64(get_field(content, 'blindedEligibilityChallenge', 'e'))
+        device_auth_signature = unb64(get_field(content, 'deviceAuthSignature', 'piAuth'))
+        if len(blinded_challenge) != 32:
+            raise ValueError('blindedEligibilityChallenge must be 32 bytes')
+
+        pk_b = ec.EllipticCurvePublicKey.from_encoded_point(ec.SECP256R1(), FIXED_DEVICE_W)
+        try:
+            pk_b.verify(device_auth_signature, blinded_challenge, ec.ECDSA(hashes.SHA256()))
+        except InvalidSignature:
+            raise ValueError('deviceAuthSignature verification failed')
+
+        e_int = int.from_bytes(blinded_challenge, 'big')
+        sk_mno_int = self.sk_mno.private_numbers().private_value
+        s_int = (state['r_mno'] - e_int * sk_mno_int) % P256_ORDER
+        partial_sig = s_int.to_bytes(32, 'big')
+        state['complete'] = True
+        partial_sig_b64 = b64(partial_sig)
+        return {
+            'mnoPartialSignature': partial_sig_b64,
+            # Compatibility alias for older workflow prototypes.
+            's': partial_sig_b64,
+        }
+
     @app.route('/zk-esim/v1/zkRequest', methods=['POST'])
     @json_endpoint
     def zk_request(self, request: IRequest, content: dict) -> dict:
@@ -143,45 +220,49 @@ class MnoServer:
         if state is None:
             raise ValueError('unknown requestId')
 
-        zk_resp_bin = unb64(content['zkProfileResponse_b64'])
-        zk_resp = rsp.asn1.decode('ZKProfileResponse', zk_resp_bin)
-        if zk_resp[0] != 'zkProfileResponseOk':
-            raise ValueError('ZKProfileResponse returned an error')
-
-        ok = zk_resp[1]
-        stmt = ok['zkStatement']
+        zk_resp_bin = unb64(get_field(content, 'zkProfileResponse', 'zkProfileResponse_b64'))
+        stmt = parse_zk_profile_response(zk_resp_bin)
         # h_cert MUST be computed over the exact on-wire DER bytes of the
         # eUICC cert so the SMDP+ verify side (which extracts from BF38 the
         # same way) produces an identical hash.  asn1tools encode/decode is
         # not guaranteed to round-trip byte-for-byte for a hand-rolled cert.
         pcert_der = extract_pcert_from_bf(zk_resp_bin, 0xbf42)
-        proof = ok['zkProof']
+        proof = stmt['requestProof']
 
         if stmt['mnoChallenge'] != state['mnoChallenge']:
             raise ValueError('challenge mismatch')
-        if stmt['pkMno'] != self.pk_mno_point:
+        if stmt['mnoPublicKey'] != self.pk_mno_point:
             raise ValueError('pkMno mismatch')
-        if stmt['pkLea'] != self.pk_lea_point:
+        if stmt['leaPublicKey'] != self.pk_lea_point:
             raise ValueError('pkLea mismatch')
 
         cert = x509.load_der_x509_certificate(pcert_der)
-        pk_u = cert.public_key()
-        zk_statement_der = rsp.asn1.encode('ZKStatement', stmt)
+        pk_u_bytes = cert.public_key().public_bytes(Encoding.X962, PublicFormat.UncompressedPoint)
+        if pk_u_bytes != stmt['userPublicKey']:
+            raise ValueError('userPublicKey mismatch with PCert_U')
+
+        binding_oid = x509.ObjectIdentifier('2.23.146.1.2.1.8')
         try:
-            pk_u.verify(proof, zk_statement_der, ec.ECDSA(hashes.SHA256()))
-        except InvalidSignature:
+            cert_hash = cert.extensions.get_extension_for_oid(binding_oid).value.value
+        except x509.ExtensionNotFound:
+            raise ValueError('PCert_U missing credentialBindingHash extension')
+        if cert_hash != stmt['credentialBindingHash']:
+            raise ValueError('credentialBindingHash mismatch with PCert_U')
+
+        if not schnorr_verify_p256(stmt['userPublicKey'], stmt['statementRaw'], proof):
             raise ValueError('invalid ZKProfile proof')
 
         eid = self._eid_from_cert(cert)
-        pid = stmt['pid']
+        pid = stmt['pseudonymId']
         h_pid = hash_fn(pid)
         h_cert = hash_fn(pcert_der)
 
-        l_auth = rsp.MerkleAccumulator()
         h_pid_hex = h_pid.hex()
-        l_auth.add(h_pid_hex)
-        root_auth = bytes(l_auth.get_root())
-        pi_inc = serialize_proof(l_auth.generateProof(h_pid_hex))
+        if h_pid_hex in self.l_auth.leaves:
+            raise ValueError('hashedPseudonym replay')
+        self.l_auth.add(h_pid_hex)
+        root_auth = bytes(self.l_auth.get_root())
+        pi_inc = serialize_proof(self.l_auth.generateProof(h_pid_hex))
 
         # ICCID and matchingId are pinned to the fixed test profile
         # smdpp-data/upp/TS48V1-A-UNIQUE.der so the SMDP+ side can serve
@@ -205,16 +286,16 @@ class MnoServer:
 
         set_req = rsp.asn1.encode('SetEligibilityDataRequest', {
             'eligibilityData': {
-                'hpid': h_pid,
-                'sigCred': sig_cred,
-                'authToken': auth_token,
-                'accRoot': root_auth,
-                'sigRoot': sig_root,
-                'accProof': pi_inc,
+                'hashedPseudonym': h_pid,
+                'credentialSignature': sig_cred,
+                'authorizationToken': auth_token,
+                'authorizationRoot': root_auth,
+                'rootSignature': sig_root,
+                'inclusionProof': pi_inc,
             }
         })
 
-        state.update({'encEid': stmt['encEid'], 'iccid': iccid})
+        state.update({'encryptedEid': stmt['encryptedEid'], 'iccid': iccid})
         return {
             'setEligibilityDataRequest': b64(set_req),
             'iccid': iccid,

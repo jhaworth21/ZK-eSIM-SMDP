@@ -21,7 +21,7 @@ Iccid ::= [APPLICATION 26] OCTET STRING (SIZE(10)) -- ICCID as coded in EFiccid,
 RemoteOpId ::= [2] INTEGER {installBoundProfilePackage(1)}
 TransactionId ::= OCTET STRING (SIZE(1..16))
  
--- Definition of EUICCInfo1 --------------------------
+-- Definition of EUICCInfo1
 GetEuiccInfo1Request ::= [32] SEQUENCE { -- Tag 'BF20'
 }
  
@@ -31,7 +31,7 @@ EUICCInfo1 ::= [32] SEQUENCE { -- Tag 'BF20'
     euiccCiPKIdListForSigning [10] SEQUENCE OF SubjectKeyIdentifier -- List of CI Public Key Identifier supported on the eUICC for signature creation
 }
  
--- Definition of EUICCInfo2 --------------------------
+-- Definition of EUICCInfo2
 GetEuiccInfo2Request ::= [34] SEQUENCE { -- Tag 'BF22'
 }
  
@@ -215,7 +215,7 @@ UpdateMetadataRequest ::= [42] SEQUENCE {  -- Tag 'BF2A'
     profilePolicyRules [25] PprIds OPTIONAL -- Tag '99'
 }
  
--- Definition of data objects for command PrepareDownload -------------------------
+-- Definition of data objects for command PrepareDownload
 PrepareDownloadRequest ::= [33] SEQUENCE {  -- Tag 'BF21'
     smdpSigned2 SmdpSigned2,            -- Signed information
     smdpSignature2 [APPLICATION 55] OCTET STRING,   -- DP_Sign1, tag '5F37'
@@ -252,7 +252,7 @@ PrepareDownloadResponseError ::= SEQUENCE {
  
 DownloadErrorCode ::= INTEGER {invalidCertificate(1), invalidSignature(2), unsupportedCurve(3), noSessionContext(4), invalidTransactionId(5), undefinedError(127)}
  
--- Definition of data objects for command AuthenticateServer--------------------
+-- Definition of data objects for command AuthenticateServer
 AuthenticateServerRequest ::= [56] SEQUENCE { -- Tag 'BF38'
     serverSigned1 ServerSigned1,                -- Signed information
     serverSignature1 [APPLICATION 55] OCTET STRING,     -- tag ?5F37?
@@ -277,7 +277,7 @@ CtxParamsForCommonAuthentication ::= SEQUENCE {
     deviceInfo DeviceInfo -- The Device information
 }
  
--- ZK-esim: need to change this
+-- Definition of data objects for command AuthenticateServer
 AuthenticateServerResponse ::= [56] CHOICE { -- Tag 'BF38'
     authenticateResponseOk AuthenticateResponseOk,
     authenticateResponseError AuthenticateResponseError
@@ -291,23 +291,20 @@ AuthenticateResponseOk ::= SEQUENCE {
 }
 
 EligibilityData ::= SEQUENCE {
-    hpid Octet32,                  -- H(pid): hashed pseudonym ID
-    sigCred OCTET STRING,          -- σ_cred: MNO sig over (H_pid, h_cert, mnoid)
-    authToken OCTET STRING,        -- T_i: one-time authorization token
-    accRoot OCTET STRING,          -- root_auth: Merkle accumulator root
-    sigRoot OCTET STRING,          -- σ^root_MNO: MNO sig over accumulator root
-    accProof OCTET STRING          -- π_inc: serialized inclusion proof
+    hashedPseudonym Octet32,       -- Hpid = H'(pid), accumulator leaf.
+    credentialSignature OCTET STRING, -- sigma_cred over Hpid || h_cert || mnoid.
+    authorizationToken OCTET STRING, -- T_i, one-time token bound to Hpid and PCert_U.
+    authorizationRoot OCTET STRING, -- root_auth after adding Hpid.
+    rootSignature OCTET STRING,    -- MNO signature over authorizationRoot.
+    inclusionProof OCTET STRING    -- Serialized accumulator proof pi_inc.
 }
 
--- Definition of data objects for ZK-eSIM Phase 1 ZKProfileRequest ------------
--- Alg. 4 in the ZK-eSIM spec.  The LPA passes the MNO's challenge
--- (N_S) into the eUICC; the eUICC returns the ZK statement x, the
--- pseudonym certificate PCert_U, and the proof pi_req.
+-- Definition of data objects for ZK-eSIM Algorithm 4: ZKRequest
+-- BF42 request carries the MNO's single-use challenge.  The response carries
+-- the public statement x, PCert_U, and the prototype request proof pi_req.
 
 ZKProfileRequest ::= [66] SEQUENCE { -- Tag 'BF42'
-    mnoChallenge Octet16           -- N_S: MNO challenge
-    -- pk_MNO, pk_LEA and mnoid are Phase-0 hardcoded in the applet and
-    -- do not travel over the wire.
+    mnoChallenge Octet16           -- N_S, binds BF42 to one MNO order attempt.
 }
 
 ZKProfileResponse ::= [66] CHOICE { -- Tag 'BF42'
@@ -316,18 +313,19 @@ ZKProfileResponse ::= [66] CHOICE { -- Tag 'BF42'
 }
 
 ZKProfileResponseOk ::= SEQUENCE {
-    zkStatement ZKStatement,                          -- x
-    pcertU Certificate,                               -- PCert_U
-    zkProof [APPLICATION 55] OCTET STRING             -- pi_req, tag '5F37'
+    zkStatement ZKStatement,                          -- Public statement x.
+    pseudonymCertificate Certificate,                 -- PCert_U from CertInit.
+    requestProof [APPLICATION 55] OCTET STRING        -- pi_req, tag '5F37'.
 }
 
 ZKStatement ::= SEQUENCE {
-    pkMno        [0] OCTET STRING,    -- pk_MNO
-    pkLea        [1] OCTET STRING,    -- pk_LEA
-    pkU          [2] OCTET STRING,    -- pk_U (eUICC pubkey)
-    mnoChallenge [3] Octet16,         -- N_S
-    pid          [4] Octet32,         -- PRF_{K_pid}(EID)
-    encEid       [5] OCTET STRING     -- PKE.Enc_{pk_LEA}(EID; r)
+    mnoPublicKey [0] OCTET STRING,   -- pk_MNO, 65-byte uncompressed P-256.
+    leaPublicKey [1] OCTET STRING,   -- pk_LEA, 65-byte uncompressed P-256.
+    userPublicKey [2] OCTET STRING,  -- pk_U derived in CertInit.
+    mnoChallenge [3] Octet16,        -- Same fresh challenge as request.
+    pseudonymId [4] Octet32,         -- pid = PRF/KDF output over EID.
+    encryptedEid [5] OCTET STRING,   -- Prototype ECIES: ePK(65) || ct(16).
+    credentialBindingHash [6] Octet32 -- SHA-256(sigma_EID), binds PCert_U.
 }
 
 ZKProfileResponseError ::= SEQUENCE {
@@ -340,15 +338,12 @@ ZKProfileErrorCode ::= INTEGER {
     undefinedError(127)
 }
 
--- Definition of data objects for ZK-eSIM Phase 2 SetEligibilityData ----------
--- Alg. 5 step 21 (re-direction): the MNO delivers the issued credentials
--- to the eUICC so that the subsequent SGP.22 AuthenticateServer flow can
--- carry them verbatim in BF38.EuiccSigned1.eligibilityData.
+-- Definition of data objects for ZK-eSIM Algorithm 5: SetEligibilityData
+-- The MNO delivers credentials to the eUICC.  The applet later carries the
+-- same bundle in BF38.EuiccSigned1.eligibilityData during Algorithm 6.
 
 SetEligibilityDataRequest ::= [67] SEQUENCE { -- Tag 'BF43'
-    eligibilityData EligibilityData     -- reuses the SEQUENCE above
-    -- mnoid and expiry are Phase-0 hardcoded constants agreed between
-    -- applet and MNO, so they are not carried here.
+    eligibilityData EligibilityData
 }
 
 SetEligibilityDataResponse ::= [67] CHOICE { -- Tag 'BF43'
@@ -363,6 +358,67 @@ SetEligibilityErrorCode ::= INTEGER {
     invalidFormat(1),
     lengthMismatch(2),
     notAllowed(3),
+    undefinedError(127)
+}
+
+-- Definition of data objects for ZK-eSIM Algorithm 2: RegisterAndIssue
+-- BF44: MNO sends a nonce commitment; eUICC responds with a blinded challenge
+-- and a prototype device-authentication signature.
+
+ZkRegisterChallengeRequest ::= [68] SEQUENCE { -- Tag 'BF44'
+    mnoNonceCommitment OCTET STRING (SIZE(65)) -- R_MNO, uncompressed P-256.
+}
+
+ZkRegisterChallengeResponse ::= [68] CHOICE { -- Tag 'BF44'
+    zkRegisterChallengeOk ZkRegisterChallengeOk,
+    zkRegisterChallengeError ZkRegisterError
+}
+
+ZkRegisterChallengeOk ::= SEQUENCE {
+    blindedEligibilityChallenge Octet32, -- Protocol e.
+    deviceAuthSignature OCTET STRING     -- pi_auth = ECDSA(sk_b, e), DER.
+}
+
+ZkRegisterCredentialRequest ::= [69] SEQUENCE { -- Tag 'BF45'
+    mnoPartialSignature Octet32          -- s = r_MNO - e * sk_MNO mod q.
+}
+
+ZkRegisterCredentialResponse ::= [69] CHOICE { -- Tag 'BF45'
+    zkRegisterCredentialOk SEQUENCE {},
+    zkRegisterCredentialError ZkRegisterError
+}
+
+-- Definition of data objects for ZK-eSIM Algorithm 3: CertInit
+-- BF46 derives a fresh user keypair; BF47 installs the PCA-issued PCert_U.
+
+ZkCertInitRequest ::= [70] SEQUENCE { -- Tag 'BF46'
+    sessionKeySeed Octet32              -- r_seed.
+}
+
+ZkCertInitResponse ::= [70] CHOICE { -- Tag 'BF46'
+    zkCertInitOk ZkCertInitOk,
+    zkCertInitError ZkRegisterError
+}
+
+ZkCertInitOk ::= SEQUENCE {
+    userPublicKey OCTET STRING (SIZE(65)), -- pk_U, uncompressed P-256.
+    bindingSignature OCTET STRING,         -- pi_bind over pk_U || EID, DER.
+    credentialBindingHash Octet32          -- SHA-256(sigma_EID).
+}
+
+ZkCertInstallRequest ::= [71] SEQUENCE { -- Tag 'BF47'
+    pseudonymCertificate Certificate       -- PCert_U signed by PCA.
+}
+
+ZkCertInstallResponse ::= [71] CHOICE { -- Tag 'BF47'
+    zkCertInstallOk SEQUENCE {},
+    zkCertInstallError ZkRegisterError
+}
+
+ZkRegisterError ::= INTEGER {
+    invalidFormat(1),
+    cryptoError(2),
+    registrationRequired(3),
     undefinedError(127)
 }
 
@@ -382,7 +438,7 @@ AuthenticateResponseError ::= SEQUENCE {
  
 AuthenticateErrorCode ::= INTEGER {invalidCertificate(1), invalidSignature(2), unsupportedCurve(3), noSessionContext(4), invalidOid(5), euiccChallengeMismatch(6), ciPKUnknown(7), undefinedError(127)}
  
--- Definition of Cancel Session------------------------------
+-- Definition of Cancel Session
 CancelSessionRequest ::= [65] SEQUENCE { -- Tag 'BF41'
     transactionId TransactionId,     -- The TransactionID generated by the RSP Server
     reason CancelSessionReason
@@ -406,7 +462,7 @@ EuiccCancelSessionSigned ::= SEQUENCE {
     reason CancelSessionReason
 }
  
--- Definition of Bound Profile Package --------------------------
+-- Definition of Bound Profile Package
 BoundProfilePackage ::= [54] SEQUENCE { -- Tag 'BF36'
     initialiseSecureChannelRequest [35] InitialiseSecureChannelRequest, -- Tag 'BF23'
     firstSequenceOf87 [0] SEQUENCE OF [7] OCTET STRING, -- sequence of '87' TLVs
@@ -415,7 +471,7 @@ BoundProfilePackage ::= [54] SEQUENCE { -- Tag 'BF36'
     sequenceOf86 [3] SEQUENCE OF [6] OCTET STRING -- sequence of '86' TLVs
 }
  
--- Definition of Get eUICC Challenge --------------------------
+-- Definition of Get eUICC Challenge
 GetEuiccChallengeRequest ::= [46] SEQUENCE { -- Tag 'BF2E'
 }
  
@@ -583,7 +639,7 @@ NotificationSentResponse ::= [48] SEQUENCE { -- Tag 'BF30'
     deleteNotificationStatus INTEGER {ok(0), nothingToDelete(1), undefinedError(127)}
 }
  
--- Definition of Enable Profile --------------------------
+-- Definition of Enable Profile
 EnableProfileRequest ::= [49] SEQUENCE { -- Tag 'BF31'
     profileIdentifier CHOICE {
         isdpAid [APPLICATION 15] OctetTo16, -- AID, tag '4F'
@@ -596,7 +652,7 @@ EnableProfileResponse ::= [49] SEQUENCE { -- Tag 'BF31'
     enableResult INTEGER {ok(0), iccidOrAidNotFound (1), profileNotInDisabledState(2), disallowedByPolicy(3), wrongProfileReenabling(4), undefinedError(127)}
 }
  
--- Definition of Disable Profile --------------------------
+-- Definition of Disable Profile
 DisableProfileRequest ::= [50] SEQUENCE { -- Tag 'BF32'
     profileIdentifier CHOICE {
         isdpAid [APPLICATION 15] OctetTo16, -- AID, tag '4F'
@@ -609,7 +665,7 @@ DisableProfileResponse ::= [50] SEQUENCE { -- Tag 'BF32'
     disableResult INTEGER {ok(0), iccidOrAidNotFound (1), profileNotInEnabledState(2), disallowedByPolicy(3), undefinedError(127)}
 }
  
--- Definition of Delete Profile --------------------------
+-- Definition of Delete Profile
 DeleteProfileRequest ::= [51] CHOICE { -- Tag 'BF33'
     isdpAid [APPLICATION 15] OctetTo16, -- AID, tag '4F'
     iccid Iccid -- ICCID, tag '5A'
@@ -619,7 +675,7 @@ DeleteProfileResponse ::= [51] SEQUENCE { -- Tag 'BF33'
     deleteResult INTEGER {ok(0), iccidOrAidNotFound (1), profileNotInDisabledState(2), disallowedByPolicy(3), undefinedError(127)}
 }
  
--- Definition of Memory Reset --------------------------
+-- Definition of Memory Reset
 EuiccMemoryResetRequest ::= [52] SEQUENCE { -- Tag 'BF34'
     resetOptions [2] BIT STRING {
         deleteOperationalProfiles(0),
@@ -631,7 +687,7 @@ EuiccMemoryResetResponse ::= [52] SEQUENCE { -- Tag 'BF34'
     resetResult INTEGER {ok(0), nothingToDelete(1), undefinedError(127)}
 }
  
--- Definition of Get EID --------------------------
+-- Definition of Get EID
 GetEuiccDataRequest ::= [62] SEQUENCE { -- Tag 'BF3E'
     tagList [APPLICATION 28] Octet1  -- tag '5C', the value SHALL be set to '5A'
 }
@@ -690,7 +746,7 @@ TotalPartialCrlNumber ::= INTEGER
 id-rsp-partialCrlNumber OBJECT IDENTIFIER ::= {id-rspExt 3}
 PartialCrlNumber ::= INTEGER
  
--- Definition for ES9+ ASN.1 Binding --------------------------
+-- Definition for ES9+ ASN.1 Binding
 RemoteProfileProvisioningRequest ::= [2] CHOICE { -- Tag 'A2'
     initiateAuthenticationRequest [57] InitiateAuthenticationRequest,  -- Tag 'BF39'
     authenticateClientRequest [59] AuthenticateClientRequest, -- Tag 'BF3B'
