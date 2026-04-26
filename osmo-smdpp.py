@@ -136,7 +136,6 @@ from pySim.esim.es8p import ProfileMetadata,UnprotectedProfilePackage,ProtectedP
 from pySim.esim.zk_utils import deserialize_proof, ecdsa_tr03111_to_dss, extract_pcert_from_bf, hash_fn, serialize_proof # noqa: E402
 from pySim.esim.x509_cert import oid, cert_policy_has_oid, cert_get_auth_key_id # noqa: E402
 from pySim.esim.x509_cert import CertAndPrivkey, CertificateSet, cert_get_subject_key_id, VerifyError # noqa: E402
-from pySim.esim.zk_utils import hash_fn, serialize_proof, deserialize_proof, ecdsa_tr03111_to_dss # noqa: E402
 
 import logging # noqa: E402
 import time # noqa: E402
@@ -183,6 +182,20 @@ FIXED_MNO_PRIVATE_SCALAR = int.from_bytes(bytes.fromhex(
     "10FFEEDDCCBBAA99887766554433221100"
 ), 'big')
 AUTH_TOKEN_VALIDITY_SECONDS = 3600
+
+
+def setupMNOValues(ss):
+    """Attach MNO public verification anchors to a --zk session.
+
+    The MNO private signing key stays in mno-server.py.  SM-DP+ only needs the
+    public key, operator identifier, and fixed token expiry to verify the BF38
+    eligibility credential bundle during authenticateClient.
+    """
+    ss.pk_mno = ec.EllipticCurvePublicKey.from_encoded_point(
+        ec.SECP256R1(), FIXED_MNO_PUBLIC_KEY)
+    ss.mnoid = FIXED_MNOID
+    ss.expiry = FIXED_EXPIRY
+    return ss
 
 
 def utcnow() -> datetime.datetime:
