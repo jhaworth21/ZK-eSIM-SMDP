@@ -149,7 +149,30 @@ def _build_pcert_u(pk_u_bytes: bytes, sk_pca, eid_ascii: str, credential_binding
         .not_valid_before(now)
         .not_valid_after(now + _dt.timedelta(days=1))
         .add_extension(x509.UnrecognizedExtension(binding_oid, credential_binding_hash), critical=False)
-        .sign(sk_pca, ec.ECDSA(hashes.SHA256()))
+        .sign(sk_pca, hashes.SHA256())
+    )
+    return cert.public_bytes(Encoding.DER)
+
+
+def _build_std_cert_u(pk_u_bytes: bytes, sk_pca, eid_ascii: str) -> bytes:
+    """Build a short-lived standard ECDSA certificate (no ZK extension) for timing comparison."""
+    if len(pk_u_bytes) != 65 or pk_u_bytes[0] != 0x04:
+        raise ValueError('user public key must be a 65-byte uncompressed P-256 point')
+
+    x_coord = int.from_bytes(pk_u_bytes[1:33], 'big')
+    y_coord = int.from_bytes(pk_u_bytes[33:65], 'big')
+    pk_u = EllipticCurvePublicNumbers(x_coord, y_coord, SECP256R1()).public_key()
+    now = _dt.datetime.now(_dt.timezone.utc)
+
+    cert = (
+        CertificateBuilder()
+        .subject_name(Name([NameAttribute(NameOID.SERIAL_NUMBER, eid_ascii)]))
+        .issuer_name(Name([NameAttribute(NameOID.ORGANIZATION_NAME, 'STD-eUICC-PCA')]))
+        .public_key(pk_u)
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(now)
+        .not_valid_after(now + _dt.timedelta(days=1))
+        .sign(sk_pca, hashes.SHA256())
     )
     return cert.public_bytes(Encoding.DER)
 

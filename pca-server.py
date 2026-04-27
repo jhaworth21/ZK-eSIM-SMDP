@@ -14,13 +14,13 @@ from cryptography.hazmat.primitives.serialization import Encoding, ParameterForm
 from klein import Klein
 from twisted.web.iweb import IRequest
 
-from pySim.esim.zk_utils import _build_pcert_u
+from pySim.esim.zk_utils import _build_pcert_u, _build_std_cert_u
 
 
 DATA_DIR = './smdpp-data'
 DEFAULT_PCA_PORT = 5443
 FIXED_PCA_PRIVATE_SCALAR = int('0102030405060708090a0b0c0d0e0f1011121314151617181920212223242526', 16)
-FIXED_TEST_EID = b'89001234567891234567891234567891'
+FIXED_TEST_EID = b'89049032000000000000123456789012'
 
 logger = logging.getLogger(__name__)
 
@@ -102,6 +102,27 @@ class PcaServer:
             # Compatibility alias for the current shell/Python prototypes.
             'pCertU': cert_b64,
         }
+
+    @app.route('/zk-esim/v1/certInitRequestStd', methods=['POST'])
+    @json_endpoint
+    def cert_init_request_std(self, request: IRequest, content: dict) -> dict:
+        """Standard ECDSA cert issuance — no ZK proof, used only for timing comparison."""
+        user_public_key = unb64(get_field(content, 'userPublicKey'))
+        binding_signature = unb64(get_field(content, 'bindingSignature'))
+
+        if len(user_public_key) != 65 or user_public_key[0] != 0x04:
+            raise ValueError('userPublicKey must be a 65-byte uncompressed P-256 point')
+
+        pk_u = ec.EllipticCurvePublicKey.from_encoded_point(ec.SECP256R1(), user_public_key)
+        eid_bin = bytes.fromhex(FIXED_TEST_EID.decode('ascii'))[:16]
+        bind_input = user_public_key + eid_bin
+        try:
+            pk_u.verify(binding_signature, bind_input, ec.ECDSA(hashes.SHA256()))
+        except Exception:
+            raise ValueError('bindingSignature verification failed')
+
+        cert = _build_std_cert_u(user_public_key, self.sk_pca, FIXED_TEST_EID.decode('ascii'))
+        return {'certificate': b64(cert)}
 
 
 def main():
