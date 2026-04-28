@@ -121,7 +121,6 @@ import functools # noqa: E402
 from typing import Optional, Dict, List # noqa: E402
 from pprint import pprint as pp # noqa: E402
 
-import datetime
 import base64 # noqa: E402
 from base64 import b64decode # noqa: E402
 from klein import Klein # noqa: E402
@@ -143,117 +142,10 @@ logger = logging.getLogger(__name__)
 DATA_DIR = './smdpp-data'
 HOSTNAME = 'testsmdpplus1.example.com' # must match certificates!
 
-#* MNO-defined values - currently hardcoded or assigned via a function 
-# server_challenge = 0x873ECFD6 # added for server challenge section 
-
-# #* Accumulator values
-# L_spent = None
-# root_spent = None
-# L_auth = None
-# root_auth = None
-# pi_inc = None
-
-# #* Pseudonym Id values (both pid and the hash of pid - H_pid)
-# pid = None
-# h_pid = None
-# h_cert = None
-
-# #* MNO key and identifier values
-# sk_mno = None
-# pk_mno = None
-# mnoid = None
-# auth_tok = None
-
-# #* MNO-based signatures
-# sig_cred = None
-
-FIXED_TEST_EID = b"89049032000000000000012345678901"
-# Fixed expiry for ZK auth token — matches FIXED_EXPIRY in ZK-eSIM applet.
-# ASCII Unix timestamp for 2100-01-01 00:00 UTC.
-FIXED_EXPIRY = b"4102444800"
-FIXED_MNOID = b"MNO_id"
-FIXED_H_CERT_STUB = b"\x30\x00"
-FIXED_MNO_PRIVATE_SCALAR = int("1f1e1d1c1b1a19181716151413121110ffeeddccbbaa99887766554433221100", 16)
-AUTH_TOKEN_VALIDITY_SECONDS = 3600
-
-
-def utcnow() -> datetime.datetime:
-    return datetime.datetime.now(datetime.timezone.utc)
-
-
-def encode_expiry(dt: datetime.datetime) -> bytes:
-    return str(int(dt.timestamp())).encode("ascii")
-
-
-def decode_expiry(expiry_raw: bytes) -> datetime.datetime:
-    expiry_ts = int(expiry_raw.decode("ascii"))
-    return datetime.datetime.fromtimestamp(expiry_ts, tz=datetime.timezone.utc)
-
-
-def setupMNOValues(ss):
-    # ZK test vectors: pk_mno is shared with the applet (both hold the same
-    # FIXED_MNO_PRIVATE_SCALAR).  The applet signs sig_cred / sig_root / auth_tok
-    # at install time using the real h_cert from its self-signed euiccCertificate;
-    # the SM-DP+ side merely verifies those signatures in authenticateClient.
-    # We still set h_pid / L_auth here so the accumulator inclusion proof matches.
-    pid = hash_fn(FIXED_TEST_EID)
-    ss.pid = pid
-    mnoid = FIXED_MNOID
-    ss.mnoid = mnoid
-
-    h_pid = hash_fn(pid)
-    ss.h_pid = h_pid
-
-    sk_mno = ec.derive_private_key(FIXED_MNO_PRIVATE_SCALAR, ec.SECP256R1())
-    pk_mno = sk_mno.public_key()
-    ss.pk_mno = pk_mno
-
-    # Single-leaf accumulator: root == h_pid, proof is empty.
-    L_auth = rsp.MerkleAccumulator()
-    h_pid_hex = h_pid.hex()
-    L_auth.add(h_pid_hex)
-    ss.L_auth = L_auth
-    ss.root_auth = bytes(L_auth.get_root())
-    L_spent = rsp.MerkleAccumulator()
-    ss.L_spent = L_spent
-    ss.root_spent = bytes(L_spent.get_root()) if L_spent.get_root() else b''
-    pi_inc = L_auth.generateProof(h_pid_hex)
-    ss.pi_inc = pi_inc
-    ss.pi_inc_bytes = serialize_proof(pi_inc)
-
-    # Use a fixed expiry that matches FIXED_EXPIRY in the applet; the applet's
-    # auth_tok is bound to this same ASCII-encoded timestamp.
-    ss.expiry = FIXED_EXPIRY
-
-    # sig_cred / sig_root / auth_tok are populated from the applet's eligibility
-    # data in authenticateClient (not pre-computed here).
-    ss.sig_cred = None
-    ss.sig_root = None
-    ss.auth_tok = None
-
-    return ss
-
 def hash_fn(input):
     digest = hashes.Hash(hashes.SHA256())
     digest.update(input)
     return digest.finalize()
-
-
-def serialize_proof(proof):
-    if not proof:
-        return b''
-    out = b''
-    for sibling in proof:
-        out += sibling
-    return out
-
-
-def deserialize_proof(blob: bytes):
-    if not blob:
-        return []
-    if len(blob) % 32 != 0:
-        return []
-    return [blob[i:i+32] for i in range(0, len(blob), 32)]
 
 
 def b64encode2str(req: bytes) -> str:
@@ -670,15 +562,7 @@ class SmDppHttpServer:
                                                       cert_get_subject_key_id(ci_cert))
         ss = self.rss[transactionId]
         ss.euicc_challenge = euiccChallenge
-        if self.zk_mode:
-            self.rss[transactionId] = setupMNOValues(ss)
-        else:
-            self.rss[transactionId] = ss
-        ss = self.rss[transactionId]
-
-        if self.zk_mode and getattr(ss, 'expiry', None):
-            # Modified protocol extension consumed by patched LPA clients.
-            output['zkAuthTokenExpiry'] = ss.expiry.decode('ascii')
+        self.rss[transactionId] = ss
 
         return output
 
@@ -731,12 +615,6 @@ class SmDppHttpServer:
             raise ApiError('8.10.1', '3.9', 'Unknown')
         ss.euicc_cert = euicc_cert
         ss.eum_cert = eum_cert
-
-        #* creates the h_cert (ie H''(PCert_U)) - overwrites the default defined value from SetupMNO
-        digest = hashes.Hash(hashes.SHA256())
-        digest.update(euiccCertificate_bin)
-        h_cert = digest.finalize()
-        ss.setHCert(h_cert)
         self.rss[transactionId] = ss
 
         # EUM chain validation: SGP.22 mandates it, but zk mode uses a self-signed
@@ -764,30 +642,6 @@ class SmDppHttpServer:
         # This runs in BOTH zk and normal mode — the zk mode skips only chain walking.
         if not self._ecdsa_verify(euicc_cert, euiccSignature1_bin, euiccSigned1_bin):
             raise ApiError('8.1', '6.1', 'Verification failed (euiccSignature1 over euiccSigned1)')
-
-        if self.zk_mode:
-            elig = euiccSigned1.get('eligibilityData', None)
-            if elig is None:
-                raise ApiError('8.1', '6.1', 'Eligibility data missing (--zk mode)')
-
-            # Enforce dynamic token-expiry window at the LPA-facing authenticateClient step.
-            if not ss.expiry:
-                raise ApiError('0.1', '2.2', 'Missing auth token expiry')
-            try:
-                expiry_dt = decode_expiry(ss.expiry)
-            except Exception:
-                raise ApiError('0.1', '2.2', 'Malformed auth token expiry')
-            if utcnow() > expiry_dt:
-                raise ApiError('0.1', '1.4', 'Authorization token expired')
-
-            ss.h_pid = elig['hpid']
-            ss.sig_cred = elig['sigCred']
-            ss.auth_tok = elig['authToken']
-            ss.root_auth = elig['accRoot']
-            ss.sig_root = elig['sigRoot']
-            ss.pi_inc_bytes = elig['accProof']
-            ss.pi_inc = deserialize_proof(ss.pi_inc_bytes)
-    
 
         ss.eid = ss.euicc_cert.subject.get_attributes_for_oid(x509.oid.NameOID.SERIAL_NUMBER)[0].value
         logger.debug("EID (from eUICC cert): %s" % ss.eid)
@@ -833,51 +687,6 @@ class SmDppHttpServer:
             raise ApiError('1.3.1', '2.2', 'ctxParams1 missing mandatory ctxParamsForCommonAuthentication')
 
         # FIXME: we actually want to perform the profile binding herr, and read the profile metadata from the profile
-
-        if self.zk_mode:
-            if not isinstance(ss.pk_mno, ec.EllipticCurvePublicKey):
-                raise ApiError('0.1', '2.2', 'MNO public key not of compatible type')
-
-            # The applet signs sig_cred / sig_root / auth_tok over the real h_cert
-            # (SHA256 of its euiccCertificate_bin) using its local FIXED_MNO scalar.
-            # Signatures arrive as raw 64-byte r||s — convert to DER before verify.
-            try:
-                ss.pk_mno.verify(ecdsa_tr03111_to_dss(ss.sig_cred),
-                                 ss.h_pid + h_cert + ss.mnoid,
-                                 ec.ECDSA(hashes.SHA256()))
-            except InvalidSignature:
-                raise ApiError('0.1', '1.2', 'Failed to verify MNO credential signature')
-
-            try:
-                # Verify MNO signature over root_auth (== h_pid for single-leaf accumulator)
-                ss.pk_mno.verify(ecdsa_tr03111_to_dss(ss.sig_root),
-                                 ss.root_auth,
-                                 ec.ECDSA(hashes.SHA256()))
-            except InvalidSignature:
-                raise ApiError('0.1', '1.3', 'Failed to verify root signature')
-
-            try:
-                # Verify MNO signature over auth_tok payload (h_pid || h_cert || mnoid || expiry)
-                ss.pk_mno.verify(ecdsa_tr03111_to_dss(ss.auth_tok),
-                                 ss.h_pid + h_cert + ss.mnoid + ss.expiry,
-                                 ec.ECDSA(hashes.SHA256()))
-            except InvalidSignature:
-                raise ApiError('0.1', '1.2', 'Failed to verify authorization token signature')
-
-            if isinstance(ss.L_auth, rsp.MerkleAccumulator):
-                if not ss.h_pid:
-                    raise ApiError('0.1', '1.3', 'Missing H_pid')
-                if not ss.root_auth:
-                    raise ApiError('0.1', '1.3', 'Missing root_auth')
-                if not ss.L_auth.verifyProof(ss.h_pid.hex(), ss.pi_inc, ss.root_auth):
-                    raise ApiError('0.1', '1.3', 'Failed to Verify Inclusion Proof')
-            else:
-                raise ApiError('0.1', '2.3', 'Accumulator not of a valid type (ie Merkle Accumulator defined in rsp.py)')
-
-            # Spend token once eligibility is validated.
-            if isinstance(ss.L_spent, rsp.MerkleAccumulator) and ss.auth_tok:
-                ss.L_spent.add(ss.auth_tok.hex())
-         
 
         # Put together profileMetadata + _bin
         ss.profileMetadata = ProfileMetadata(iccid_bin=h2b(swap_nibbles(iccid_str)), spn="OsmocomSPN", profile_name=matchingId)
@@ -1114,7 +923,7 @@ def main(argv):
                         action='store_true', default=False)
     parser.add_argument("-m", "--in-memory", help="Use ephermal in-memory session storage (for concurrent runs)",
                         action='store_true', default=False)
-    parser.add_argument("-z", "--zk", help="Enable ZK-eSIM eligibility verification",
+    parser.add_argument("-z", "--zk", help="ZK-eSIM applet test mode: skip EUM/CI chain validation and derive BSP session keys from the ECDH shared secret",
                         action='store_true', default=False)
     args = parser.parse_args()
 

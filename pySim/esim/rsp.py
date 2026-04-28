@@ -20,9 +20,7 @@ from typing import Optional
 import shelve
 
 from cryptography.hazmat.primitives.asymmetric import ec
-from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat, load_der_public_key
-from cryptography.hazmat.primitives import hashes # noqa: E402
-from cryptography.hazmat.primitives.asymmetric import ec # noqa: E402
+from cryptography.hazmat.primitives.serialization import Encoding
 
 from cryptography import x509
 from osmocom.utils import b2h
@@ -53,29 +51,7 @@ class RspSessionState:
         self.smdp_otpk: Optional[bytes] = None
         self.host_id: Optional[bytes] = None
         self.shared_secret: Optional[bytes] = None
-        #* Added state values for zk-eSIM 
-        self.euicc_challenge: Optional[bytes] = None            #* Added EUICC challenge (N_u)
-        self.h_cert: Optional[bytes] = None                     #* Added hashed pseudonym ceritificate (h_cert)
-        self.t_i: Optional[bytes] = None                        #* Added authorisation token (ie T_i)
-        self.L_spent: Optional[MerkleAccumulator] = None        #* Added accumulator to the RSP (L_spent)
-        self.root_spent: Optional[bytes] = None                 #* Added hash of L_spent (root_spent)
-        self.L_auth: Optional[MerkleAccumulator] = None         #* Added accumulator for auth tokens (L_auth)
-        self.root_auth: Optional[bytes] = None                  #* Added hash of L_auth (root_auth)
-        self.pi_inc: Optional[list] = None                      #* Added proof of inclusion in accumulator (π_inc)
-        #* Pseudonym Id values (both pid and the hash of pid - H_pid)
-        self.pid: Optional[bytes] = None                        #* Added per session pseudonym (pid)
-        self.h_pid: Optional[bytes] = None                      #* Added hash of pid (H_pid)
-        #* MNO key and identifier values    
-        #! self.sk_mno: Optional[bytes] = None                  # Not used but needed to generate the public key               
-        self.pk_mno: Optional[ec.EllipticCurvePublicKey] = None #* Added public key for the mno - may need to be hardcoded
-        self.mnoid: Optional[bytes] = None                      #* Added the mno id - endcoded string as utf-8
-        self.auth_tok: Optional[bytes] = None                   #* Added authorisation token (T_i) - one time token
-        self.expiry: Optional[bytes] = None                     #* Added expiry of the auth_token for the T_i verification step
-        #* MNO-based signatures
-        self.sig_cred: Optional[bytes] = None                   #* Added signature over (H_pid, h_cert, mnoid)
-        self.sig_root: Optional[bytes] = None                   #* Added signature over (root_auth, sig^MNO_root)
-        
-
+        self.euicc_challenge: Optional[bytes] = None
 
     def __getstate__(self):
         """helper function called when pickling the object to persistent storage.  We must pickel all
@@ -94,10 +70,6 @@ class RspSessionState:
             state['_smdp_otsk'] = self.smdp_ot.private_numbers().private_value
             state['_smdp_ot_curve'] = self.smdp_ot.curve
             del state['smdp_ot']
-        # serialize MNO public key for zk mode session persistence
-        if state.get('pk_mno', None):
-            state['_pk_mno'] = self.pk_mno.public_bytes(Encoding.DER, PublicFormat.SubjectPublicKeyInfo)
-            del state['pk_mno']
         return state
 
     def __setstate__(self, state):
@@ -119,18 +91,8 @@ class RspSessionState:
             # FIXME: how to add the public key from smdp_otpk to an instance of EllipticCurvePrivateKey?
             del state['_smdp_otsk']
             del state['_smdp_ot_curve']
-        # restore MNO public key for zk mode
-        if '_pk_mno' in state:
-            self.pk_mno = load_der_public_key(state['_pk_mno'])
-            del state['_pk_mno']
-        else:
-            self.pk_mno = None
         # automatically recover all the remaining state
         self.__dict__.update(state)
-
-    #* Added to enable the h_cert to be stored in the session state
-    def setHCert(self, hCert: bytes):
-        self.h_cert = hCert
 
 
 class RspSessionStore:
@@ -217,78 +179,3 @@ def extract_euiccSigned2(prepareDownloadResponse: bytes) -> bytes:
     if rawtag != 0x30:
         raise ValueError('Unexpected tag where SEQUENCE was expected')
     return tlv2
-
-def hash_fn(input):
-    digest = hashes.Hash(hashes.SHA256())
-    digest.update(input)
-    return digest.finalize()
-
-class MerkleAccumulator():
-
-    def __init__(self):
-        self.leaves = {}
-        self.root = []
-
-    def _compute_root(self):
-        nodes = list(self.leaves.values())
-        if not nodes:
-            self.root = None
-            return
-
-        while len(nodes) > 1:
-            next_level = []
-            for i in range(0, len(nodes), 2):
-                left = nodes[i]
-                right = nodes[i + 1] if i + 1 < len(nodes) else left
-                next_level.append(hash_fn(left+right))
-            nodes = next_level
-        self.root = nodes[0]
-
-    def add(self, element: str):
-        if element in self.leaves:
-            return
-        leaf_hash = bytes.fromhex(element)
-        self.leaves[element] = leaf_hash
-        self._compute_root()
-
-    def remove(self, element: str):
-        if element in self.leaves:
-            del self.leaves[element]
-            self._compute_root()
-
-    def get_root(self):
-        return self.root
-    
-    def generateProof(self, element: str):
-        """
-        Generate a simple membership proof.
-        Returns the path of sibling hashes from leaf to root.
-        """
-        if element not in self.leaves:
-            return None
-        nodes = list(self.leaves.values())
-        index = list(self.leaves.keys()).index(element)
-        proof = []
-        while len(nodes) > 1:
-            next_level = []
-            for i in range(0, len(nodes), 2):
-                left = nodes[i]
-                right = nodes[i + 1] if i + 1 < len(nodes) else left
-                next_level.append(hash_fn(left+right))
-                if i <= index < i + 2:
-                    sibling = right if i == index else left
-                    proof.append(sibling)
-            index = index // 2
-            nodes = next_level
-        return proof
-
-    @staticmethod
-    def verifyProof(element: str, proof: list, root: bytes) -> bool:
-        """Verify membership proof for an element."""
-        current = bytes.fromhex(element)
-        for sibling in proof:
-            if current < sibling:
-                current = hash_fn(current + sibling)
-            else:
-                current = hash_fn(sibling + current)
-        return current == root

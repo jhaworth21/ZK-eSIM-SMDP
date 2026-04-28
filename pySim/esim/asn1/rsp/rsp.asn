@@ -290,22 +290,12 @@ AuthenticateResponseOk ::= SEQUENCE {
     eumCertificate Certificate                        -- EUM Certificate (CERT.EUM.ECDSA) signed by the requested CI
 }
 
-EligibilityData ::= SEQUENCE {
-    hpid Octet32,                  -- H(pid): hashed pseudonym ID
-    sigCred OCTET STRING,          -- σ_cred: MNO sig over (H_pid, h_cert, mnoid)
-    authToken OCTET STRING,        -- T_i: one-time authorization token
-    accRoot OCTET STRING,          -- root_auth: Merkle accumulator root
-    sigRoot OCTET STRING,          -- σ^root_MNO: MNO sig over accumulator root
-    accProof OCTET STRING          -- π_inc: serialized inclusion proof
-}
-
 EuiccSigned1 ::= SEQUENCE {
     transactionId [0] TransactionId,
     serverAddress [3] UTF8String,
     serverChallenge [4] Octet16,                  -- The RSP Server Challenge
     euiccInfo2 [34] EUICCInfo2,
-    ctxParams1 CtxParams1,
-    eligibilityData [5] EligibilityData OPTIONAL  -- ZK-eSIM: Phase 2 artefacts
+    ctxParams1 CtxParams1
 }
  
 AuthenticateResponseError ::= SEQUENCE {
