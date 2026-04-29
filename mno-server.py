@@ -300,7 +300,7 @@ class MnoServer:
             'setEligibilityDataRequest': b64(set_req),
             'iccid': iccid,
             'matchingId': conf['matchingId'],
-            'smdpAddress': conf.get('smdpAddress') or self._smdp_host()
+            'smdpAddress': self._smdp_authority()
         }
 
     @app.route('/zk-esim/v1/ack', methods=['POST'])
@@ -322,6 +322,10 @@ class MnoServer:
 
     def _smdp_host(self) -> str:
         return self.smdp_url.split('://', 1)[-1].split(':', 1)[0]
+
+    def _smdp_authority(self) -> str:
+        # host[:port] from the configured smdp_url, port preserved.
+        return self.smdp_url.split('://', 1)[-1].split('/', 1)[0]
 
 
 def main():
