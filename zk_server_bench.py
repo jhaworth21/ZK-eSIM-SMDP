@@ -4,11 +4,27 @@
 # Server-side performance benchmark for the additional overhead that the
 # ZK-eSIM design introduces over a standard SGP.22 profile download.
 #
-# This is a *CPU microbenchmark*: it times the real cryptographic code paths
-# executed by the SM-DP+ (osmo-smdpp.py), the MNO role (mno-server.py) and the
-# PCA role (pca-server.py) and reports the marginal cost per download, per
-# thousand downloads and per million downloads, together with single-core
-# throughput and a worked fleet-sizing example.
+# This is a *CPU microbenchmark*, reported PER SERVER: the three roles of the
+# deployment are separate processes on separate hosts, so their costs are timed
+# and totalled independently rather than pooled into one figure.
+#
+#   1. SM-DP+  (osmo-smdpp.py)  -- per profile download; the only role that
+#                                  also pays the baseline SGP.22 transport cost
+#   2. MNO     (mno-server.py)  -- per profile download (zkRequest) AND per
+#                                  device enrollment (registerCredential)
+#   3. PCA     (pca-server.py)  -- per profile download (certInitRequest)
+#
+# The PCA is on the *download* path, not the one-time enrollment path: Phase 1
+# CertInit runs before every download (zkesim_workflow.sh phase0_certinit), and
+# each call issues a fresh PCert_U over a freshly derived sk_U.  That freshness
+# is what makes successive downloads unlinkable, so a pseudonym cert cannot be
+# amortised across downloads and the PCA pays its cost once per download.
+# Only the MNO's Phase 0 registerCredential is genuinely one-time per device.
+#
+# For each server the report gives the per-transaction cost, the cost per
+# thousand / per million transactions, single-core throughput and the number of
+# cores needed to sustain a target daily volume -- so each role can be sized on
+# its own hardware.  A final table puts the three side by side.
 #
 # It deliberately excludes TLS / HTTP / ASN.1 framing and disk I/O: a standard
 # (non-ZK) download pays those too, so they are not the *additional* overhead
@@ -19,12 +35,13 @@
 # (pySim.esim.rsp, pySim.esim.zk_utils) or invoked with the identical
 # `cryptography` call patterns the servers use, so the numbers reflect the
 # deployed code rather than a re-implementation.
-"""ZK-eSIM server-side overhead benchmark.
+"""ZK-eSIM server-side overhead benchmark, measured per server role.
 
 Run inside the same environment the servers run in (the `pysim` conda env)::
 
     python3 zk_server_bench.py
     python3 zk_server_bench.py --iters 5000 --accumulator-size 4096
+    python3 zk_server_bench.py --server mno            # one role only
     python3 zk_server_bench.py --json /tmp/zk_bench.json --csv /tmp/zk_bench.csv
 """
 
@@ -74,6 +91,60 @@ _P256_P = zk_utils._P256_P
 _P256_A = zk_utils._P256_A
 _G = (zk_utils._P256_GX, zk_utils._P256_GY)
 _CURVE_P256 = ec.SECP256R1()
+
+# ---------------------------------------------------------------------------
+# The three server roles.  Every timed op is tagged with the server that runs
+# it and the transaction phase it runs in, so the totals never mix roles.
+# ---------------------------------------------------------------------------
+SMDP, MNO, PCA = 'smdp', 'mno', 'pca'
+SERVER_ORDER = (SMDP, MNO, PCA)
+
+SERVERS = {
+    SMDP: {
+        'label': 'SM-DP+',
+        'module': 'osmo-smdpp.py',
+        'role': 'profile download server (ES9+ authenticateClient / getBoundProfilePackage)',
+    },
+    MNO: {
+        'label': 'MNO',
+        'module': 'mno-server.py',
+        'role': 'eligibility authority (zkRequest per download, registerCredential per device)',
+    },
+    PCA: {
+        'label': 'PCA',
+        'module': 'pca-server.py',
+        'role': 'pseudonym certificate authority (certInitRequest, once per download)',
+    },
+}
+
+# Per-server cost composition.  Each item is (op_name, multiplicity) -- how
+# many times that server performs the op in a single transaction (e.g. the MNO
+# emits three raw ECDSA signatures per zkRequest).
+#
+# SM-DP+ per download -------------------------------------------------------
+# Baseline (non-ZK) transport crypto: euiccSignature1, EUM chain walk, and the
+# smdpSignature2 the SM-DP+ produces for the BPP.
+SMDP_BASELINE = [('base.verify_euicc_sig1', 1), ('base.chain_walk', 1), ('base.smdp_sign2', 1)]
+# ZK additions inside authenticateClient (osmo-smdpp.py:826-867).
+SMDP_ZK_ADDON = [('smdp.verify_sig_cred', 1), ('smdp.verify_sig_root', 1),
+                 ('smdp.verify_auth_tok', 1), ('smdp.merkle_verify', 1),
+                 ('smdp.token_bookkeeping', 1)]
+# What ZK mode *stops* doing: the self-signed ZK eUICC cert has no EUM issuer,
+# so osmo-smdpp.py:734 skips the chain walk (euiccSignature1 is still verified).
+SMDP_ZK_SKIPPED = [('base.chain_walk', 1)]
+
+# MNO -----------------------------------------------------------------------
+# zkRequest, minus the Schnorr verify (measured in two variants below).
+MNO_DOWNLOAD_CORE = [('mno.ecdsa_sign', 3), ('mno.accumulator_recompute', 1),
+                     ('mno.accumulator_genproof', 1)]
+MNO_ACCUMULATOR = [('mno.accumulator_recompute', 1), ('mno.accumulator_genproof', 1)]
+MNO_ENROLL = [('mno.register_device_verify', 1), ('mno.register_blind_sig', 1)]
+
+# PCA -----------------------------------------------------------------------
+# certInitRequest, run once per download: verify the pk_U||EID binding
+# signature, then issue (build + sign) the pseudonym certificate PCert_U.
+PCA_DOWNLOAD = [('pca.binding_verify', 1), ('pca.build_pcert', 1)]
+PCA_DOWNLOAD_STD = [('pca.binding_verify', 1), ('pca.build_std_cert', 1)]
 
 
 def _ec_affine_add(pt, q):
@@ -373,7 +444,7 @@ def build_fixtures(curve, accumulator_size):
     def smdp_sign2():
         sk_dp.sign(smdp_signed2, ec.ECDSA(sha256))
 
-    # --- PCA per-enrollment (pca-server.py certInitRequest) ----------------
+    # --- PCA per-download (pca-server.py certInitRequest) ------------------
     def pca_binding_verify():
         pk_u_obj.verify(binding_sig, pk_u_bytes + EID_BIN, ec.ECDSA(sha256))
 
@@ -391,30 +462,30 @@ def build_fixtures(curve, accumulator_size):
         e_int = int.from_bytes(blinded_challenge, 'big')
         _ = (r_mno - e_int * sk_mno_int) % _P256_N
 
+    # name -> (callable, server, phase).  `phase` is 'download', 'enroll' or
+    # 'baseline' (transport crypto a non-ZK download pays too).
     f.update({
-        # SM-DP+ ZK additions (per download)
-        'smdp.verify_sig_cred':   (verify_sig_cred, 'group:smdp_zk'),
-        'smdp.verify_sig_root':   (verify_sig_root, 'group:smdp_zk'),
-        'smdp.verify_auth_tok':   (verify_auth_tok, 'group:smdp_zk'),
-        'smdp.merkle_verify':     (merkle_verify, 'group:smdp_zk'),
-        'smdp.token_bookkeeping': (token_bookkeeping, 'group:smdp_zk'),
-        # MNO ZK additions (per download)
-        'mno.schnorr_verify':     (schnorr_verify, 'group:mno_dl'),
-        'mno.schnorr_verify_hazmat': (schnorr_verify_lib, 'group:mno_dl'),
-        'mno.ecdsa_sign':         (mno_sign, 'group:mno_dl'),
-        'mno.accumulator_recompute': (accumulator_recompute, 'group:mno_dl'),
-        'mno.accumulator_genproof':  (accumulator_genproof, 'group:mno_dl'),
-        # baseline SGP.22 transport
-        'base.verify_euicc_sig1': (verify_euicc_sig1, 'group:base'),
-        'base.chain_walk':        (chain_walk, 'group:base'),
-        'base.smdp_sign2':        (smdp_sign2, 'group:base'),
-        # PCA enrollment (one-time)
-        'pca.binding_verify':     (pca_binding_verify, 'group:enroll'),
-        'pca.build_pcert':        (pca_build_pcert, 'group:enroll'),
-        'pca.build_std_cert':     (pca_build_std_cert, 'group:enroll'),
-        # MNO enrollment (one-time)
-        'mno.register_device_verify': (register_device_verify, 'group:enroll'),
-        'mno.register_blind_sig':     (register_blind_sig, 'group:enroll'),
+        # --- SM-DP+ -------------------------------------------------------
+        'smdp.verify_sig_cred':      (verify_sig_cred, SMDP, 'download'),
+        'smdp.verify_sig_root':      (verify_sig_root, SMDP, 'download'),
+        'smdp.verify_auth_tok':      (verify_auth_tok, SMDP, 'download'),
+        'smdp.merkle_verify':        (merkle_verify, SMDP, 'download'),
+        'smdp.token_bookkeeping':    (token_bookkeeping, SMDP, 'download'),
+        'base.verify_euicc_sig1':    (verify_euicc_sig1, SMDP, 'baseline'),
+        'base.chain_walk':           (chain_walk, SMDP, 'baseline'),
+        'base.smdp_sign2':           (smdp_sign2, SMDP, 'baseline'),
+        # --- MNO ----------------------------------------------------------
+        'mno.schnorr_verify':        (schnorr_verify, MNO, 'download'),
+        'mno.schnorr_verify_hazmat': (schnorr_verify_lib, MNO, 'download'),
+        'mno.ecdsa_sign':            (mno_sign, MNO, 'download'),
+        'mno.accumulator_recompute': (accumulator_recompute, MNO, 'download'),
+        'mno.accumulator_genproof':  (accumulator_genproof, MNO, 'download'),
+        'mno.register_device_verify': (register_device_verify, MNO, 'enroll'),
+        'mno.register_blind_sig':     (register_blind_sig, MNO, 'enroll'),
+        # --- PCA ----------------------------------------------------------
+        'pca.binding_verify':        (pca_binding_verify, PCA, 'download'),
+        'pca.build_pcert':           (pca_build_pcert, PCA, 'download'),
+        'pca.build_std_cert':        (pca_build_std_cert, PCA, 'download'),
     })
 
     meta.update({
@@ -436,6 +507,8 @@ def sanity_check(ops):
         'mno.register_device_verify',
     ]
     for name in checks:
+        if name not in ops:            # server filtered out via --server
+            continue
         fn = ops[name][0]
         try:
             fn()
@@ -481,6 +554,83 @@ def fmt_per_n(seconds, n):
 
 
 # ---------------------------------------------------------------------------
+# Per-server cost composition
+# ---------------------------------------------------------------------------
+def compose_per_server(results, selected):
+    """Total the measured op means into per-server, per-transaction costs.
+
+    Returns {server: {metric: seconds}}.  Nothing is summed across servers:
+    each role runs in its own process and is sized on its own hardware, so the
+    SM-DP+, MNO and PCA figures stay separate.  HEADLINE (below) picks, per
+    server, which of its metrics drives the throughput / core-count sizing.
+    """
+    def total(items):
+        return sum(mult * results[n]['mean_ns'] for n, mult in items) / 1e9
+
+    out = {}
+
+    if SMDP in selected:
+        baseline = total(SMDP_BASELINE)
+        addon = total(SMDP_ZK_ADDON)
+        skipped = total(SMDP_ZK_SKIPPED)
+        out[SMDP] = {
+            'download_baseline_non_zk': baseline,
+            'download_zk_mode_total': baseline - skipped + addon,
+            'download_zk_addon_gross': addon,
+            'download_zk_addon_net': addon - skipped,
+            'download_chain_walk_saved': skipped,
+            'enrollment': 0.0,          # SM-DP+ takes no part in enrollment
+        }
+
+    if MNO in selected:
+        core = total(MNO_DOWNLOAD_CORE)
+        out[MNO] = {
+            'download': core + total([('mno.schnorr_verify_hazmat', 1)]),
+            'download_pure_python_schnorr': core + total([('mno.schnorr_verify', 1)]),
+            'download_accumulator_oN': total(MNO_ACCUMULATOR),
+            'enrollment': total(MNO_ENROLL),
+        }
+
+    if PCA in selected:
+        out[PCA] = {
+            'download': total(PCA_DOWNLOAD),
+            'download_std_cert_variant': total(PCA_DOWNLOAD_STD),
+            'enrollment': 0.0,          # a fresh PCert_U per download; nothing one-time
+        }
+
+    return out
+
+
+# Which metric drives each server's throughput / core-count extrapolation.
+HEADLINE = {
+    SMDP: ('download_zk_addon_net', 'enrollment'),
+    MNO:  ('download', 'enrollment'),
+    PCA:  ('download', 'enrollment'),
+}
+
+# Per-server metric labels for the report, in print order.
+METRIC_LABELS = {
+    SMDP: [
+        ('download_baseline_non_zk',  'Baseline download, non-ZK (SM-DP+ crypto only)'),
+        ('download_zk_mode_total',    'ZK-mode download, total SM-DP+ crypto'),
+        ('download_zk_addon_gross',   'ZK add-on, gross'),
+        ('download_chain_walk_saved', '  minus EUM chain walk skipped in ZK mode'),
+        ('download_zk_addon_net',     'ZK add-on, NET marginal cost per download'),
+    ],
+    MNO: [
+        ('download',                     'Per download, zkRequest (OpenSSL/hazmat Schnorr)'),
+        ('download_pure_python_schnorr', 'Per download, zkRequest (pure-Python Schnorr)'),
+        ('download_accumulator_oN',      '  of which accumulator work, O(N)'),
+        ('enrollment',                   'Per enrollment, registerCredential (one-time)'),
+    ],
+    PCA: [
+        ('download',                  'Per download, certInitRequest (issues PCert_U)'),
+        ('download_std_cert_variant', '  standard-cert variant (certInitRequestStd)'),
+    ],
+}
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 def main(argv):
@@ -492,58 +642,36 @@ def main(argv):
                     help='number of enrolled pseudonyms in the Merkle accumulator')
     ap.add_argument('-c', '--curve', choices=['nist', 'brainpool'], default='nist',
                     help='curve for SGP.22 transport crypto (ZK ops stay P-256)')
+    ap.add_argument('-s', '--server', action='append', choices=list(SERVER_ORDER),
+                    help='measure only this server role (repeatable; default: all three)')
     ap.add_argument('--downloads-per-day', type=float, default=1_000_000,
-                    help='target volume for the fleet-sizing example')
+                    help='target download volume for the per-server sizing example')
+    ap.add_argument('--enrollments-per-day', type=float, default=None,
+                    help='target enrollment volume (default: same as --downloads-per-day)')
     ap.add_argument('--json', metavar='PATH', help='write full results as JSON')
     ap.add_argument('--csv', metavar='PATH', help='write per-op stats as CSV')
     ap.add_argument('-q', '--quiet', action='store_true', help='suppress the stdout report')
     args = ap.parse_args(argv)
 
+    if args.enrollments_per_day is None:
+        args.enrollments_per_day = args.downloads_per_day
+    selected = tuple(s for s in SERVER_ORDER if not args.server or s in args.server)
+
     curve = ec.SECP256R1() if args.curve == 'nist' else ec.BrainpoolP256R1()
 
     ops, meta = build_fixtures(curve, args.accumulator_size)
+    ops = {n: v for n, v in ops.items() if v[1] in selected}
     sanity_check(ops)
 
     results = {}
-    for name, (fn, group) in ops.items():
+    for name, (fn, server, phase) in ops.items():
         it, wu = iters_for(name, args.iters, args.warmup)
         stats = bench(fn, it, wu)
-        stats['group'] = group.split(':', 1)[1]
+        stats['server'] = server
+        stats['phase'] = phase
         results[name] = stats
 
-    def mean_s(name):
-        return results[name]['mean_ns'] / 1e9
-
-    # --- composed scenarios (seconds) --------------------------------------
-    smdp_zk_gross = sum(mean_s(n) for n in (
-        'smdp.verify_sig_cred', 'smdp.verify_sig_root', 'smdp.verify_auth_tok',
-        'smdp.merkle_verify', 'smdp.token_bookkeeping'))
-    smdp_zk_net = smdp_zk_gross - mean_s('base.chain_walk')   # ZK mode skips the chain walk
-    acc_cost = mean_s('mno.accumulator_recompute') + mean_s('mno.accumulator_genproof')
-    mno_dl = (mean_s('mno.schnorr_verify') + 3 * mean_s('mno.ecdsa_sign') + acc_cost)
-    # Library-backed variant: use the measured OpenSSL/hazmat Schnorr verify
-    # instead of the prototype pure-Python verifier.
-    mno_dl_hazmat = (mean_s('mno.schnorr_verify_hazmat')
-                     + 3 * mean_s('mno.ecdsa_sign') + acc_cost)
-    baseline_dl = (mean_s('base.verify_euicc_sig1')
-                   + mean_s('base.chain_walk')
-                   + mean_s('base.smdp_sign2'))
-    zk_dl_total = smdp_zk_gross + mno_dl
-    zk_dl_total_hazmat = smdp_zk_gross + mno_dl_hazmat
-    enroll_total = sum(mean_s(n) for n in (
-        'mno.register_device_verify', 'mno.register_blind_sig',
-        'pca.binding_verify', 'pca.build_pcert'))
-
-    scenarios = {
-        'baseline_download_smdp': baseline_dl,
-        'zk_smdp_addon_gross': smdp_zk_gross,
-        'zk_smdp_addon_net_of_chainwalk': smdp_zk_net,
-        'zk_mno_per_download': mno_dl,
-        'zk_per_download_total_all_roles': zk_dl_total,
-        'zk_per_download_total_hazmat': zk_dl_total_hazmat,
-        'zk_per_enrollment_one_time': enroll_total,
-        'mno_accumulator_per_download_oN': acc_cost,
-    }
+    per_server = compose_per_server(results, selected)
 
     env = {
         'platform': platform.platform(),
@@ -554,13 +682,14 @@ def main(argv):
         'curve_zk': 'nist-p256 (pinned by servers)',
         'iters': args.iters,
         'warmup': args.warmup,
+        'servers_measured': list(selected),
         **meta,
     }
 
-    payload = {'env': env, 'ops': results, 'scenarios_seconds': scenarios}
+    payload = {'env': env, 'ops': results, 'per_server_seconds': per_server}
 
     if not args.quiet:
-        print_report(payload, scenarios, results, args)
+        print_report(payload, per_server, results, args, selected)
 
     if args.json:
         import json
@@ -570,23 +699,120 @@ def main(argv):
     if args.csv:
         with open(args.csv, 'w', newline='') as fh:
             wr = csv.writer(fh)
-            wr.writerow(['op', 'group', 'count', 'mean_us', 'median_us',
+            wr.writerow(['op', 'server', 'phase', 'count', 'mean_us', 'median_us',
                          'p95_us', 'p99_us', 'stdev_us', 'ops_per_sec'])
             for name, st in results.items():
-                wr.writerow([name, st['group'], st['count'],
+                wr.writerow([name, st['server'], st['phase'], st['count'],
                              f"{st['mean_ns'] / 1e3:.3f}", f"{st['median_ns'] / 1e3:.3f}",
                              f"{st['p95_ns'] / 1e3:.3f}", f"{st['p99_ns'] / 1e3:.3f}",
                              f"{st['stdev_ns'] / 1e3:.3f}", f"{st['ops_per_sec']:.1f}"])
+            wr.writerow([])
+            wr.writerow(['server', 'metric', 'seconds', 'microseconds'])
+            for server, metrics in payload['per_server_seconds'].items():
+                for metric, sec in metrics.items():
+                    wr.writerow([server, metric, f'{sec:.9f}', f'{sec * 1e6:.3f}'])
         print(f'[csv]   wrote {args.csv}')
 
     return 0
 
 
-def print_report(payload, scenarios, results, args):
+def print_scale(sec, per_day, unit, indent='      '):
+    """Throughput / fleet-sizing lines for one per-transaction cost."""
+    print(f'{indent}per {unit:<12}: {fmt_per_n(sec, 1)}')
+    print(f'{indent}per 1,000       : {fmt_per_n(sec, 1_000)}')
+    print(f'{indent}per 1,000,000   : {fmt_per_n(sec, 1_000_000)}')
+    print(f'{indent}single-core rate: {1.0 / sec:,.0f} {unit}s/sec/core'
+          f'  ≈ {86_400.0 / sec:,.0f} {unit}s/day/core')
+    cores = per_day * sec / 86_400.0
+    print(f'{indent}to sustain {per_day:,.0f} {unit}s/day: '
+          f'{cores:.3g} CPU-core(s) ({math.ceil(cores)} core(s) rounded up)')
+
+
+def print_server_section(idx, n, server, metrics, results, args):
+    """One self-contained block per server: its ops, its totals, its sizing."""
+    info = SERVERS[server]
+    print()
+    print('=' * 78)
+    print(f"SERVER {idx}/{n} — {info['label']}  ({info['module']})")
+    print(f"  role: {info['role']}")
+    print('=' * 78)
+
+    # --- per-op table, this server only ------------------------------------
+    phases = [('download', 'per-download ZK work'),
+              ('baseline', 'baseline SGP.22 transport (paid by ZK and non-ZK downloads)'),
+              ('enroll', 'per-enrollment work (one-time per device)')]
+    own = {nm: st for nm, st in results.items() if st['server'] == server}
+    if own:
+        print(f"{'operation':<34}{'mean':>12}{'median':>12}{'p95':>12}{'ops/s':>10}")
+        print('-' * 78)
+        for phase, title in phases:
+            rows = [(nm, st) for nm, st in own.items() if st['phase'] == phase]
+            if not rows:
+                continue
+            print(f'• {title}')
+            for nm, st in rows:
+                print(f"  {nm:<32}{fmt_ns(st['mean_ns']):>12}{fmt_ns(st['median_ns']):>12}"
+                      f"{fmt_ns(st['p95_ns']):>12}{st['ops_per_sec']:>10,.0f}")
+        print('-' * 78)
+
+    # --- composed totals for this server -----------------------------------
+    print(f"\n  {info['label']} per-transaction cost (sum of component means)")
+    for key, lab in METRIC_LABELS[server]:
+        if key not in metrics:
+            continue
+        print(f"  {lab:<56}{fmt_ns(metrics[key] * 1e9):>14}")
+
+    # --- sizing, driven by this server's headline metrics -------------------
+    dl_key, en_key = HEADLINE[server]
+    dl = metrics.get(dl_key, 0.0)
+    en = metrics.get(en_key, 0.0)
+    if dl > 0:
+        print(f"\n  at scale — {dict(METRIC_LABELS[server]).get(dl_key, dl_key)}")
+        print_scale(dl, args.downloads_per_day, 'download')
+    else:
+        print('\n  at scale — not in the download path (0 s per download)')
+    if en > 0:
+        print(f"\n  at scale — {dict(METRIC_LABELS[server]).get(en_key, en_key)}")
+        print_scale(en, args.enrollments_per_day, 'enrollment')
+    else:
+        print('  at scale — takes no part in enrollment (0 s per enrollment)')
+
+
+def print_summary_table(per_server, args):
+    """The three servers side by side, still never summed together."""
+    print()
+    print('=' * 78)
+    print('PER-SERVER SUMMARY (single core, mean of component means)')
+    print('=' * 78)
+    print(f"{'server':<10}{'per download':>15}{'per enrollment':>16}"
+          f"{'dl/sec/core':>14}{'cores @ target':>15}")
+    print('-' * 78)
+    for server in SERVER_ORDER:
+        if server not in per_server:
+            continue
+        metrics = per_server[server]
+        dl_key, en_key = HEADLINE[server]
+        dl = metrics.get(dl_key, 0.0)
+        en = metrics.get(en_key, 0.0)
+        rate = f'{1.0 / dl:,.0f}' if dl > 0 else '—'
+        cores = (f'{math.ceil(args.downloads_per_day * dl / 86_400.0)}' if dl > 0 else '—')
+        print(f"{SERVERS[server]['label']:<10}"
+              f"{(fmt_ns(dl * 1e9).strip() if dl > 0 else '—'):>15}"
+              f"{(fmt_ns(en * 1e9).strip() if en > 0 else '—'):>16}"
+              f"{rate:>14}{cores:>15}")
+    print('-' * 78)
+    print('  per download   = SM-DP+: net ZK add-on | MNO: full zkRequest crypto '
+          '| PCA: certInitRequest')
+    print(f'  cores @ target = to sustain {args.downloads_per_day:,.0f} downloads/day '
+          f'on that server alone')
+    print('  the three columns are NOT additive: separate processes, separate hosts.')
+
+
+def print_report(payload, per_server, results, args, selected):
     env = payload['env']
     line = '=' * 78
     print(line)
-    print('ZK-eSIM SERVER-SIDE OVERHEAD BENCHMARK')
+    print('ZK-eSIM SERVER-SIDE OVERHEAD BENCHMARK  (measured per server role)')
     print(line)
     print(f"host        : {env['platform']}")
     print(f"cpu / python: {env['processor']}  |  Python {env['python']}  |  "
@@ -596,69 +822,32 @@ def print_report(payload, scenarios, results, args):
     print(f"accumulator : {env['accumulator_size']} enrolled pseudonyms, "
           f"Merkle proof depth={env['merkle_proof_depth']} "
           f"({'single-leaf root==h_pid' if env['single_leaf'] else 'multi-leaf tree'})")
+    print(f"targets     : {args.downloads_per_day:,.0f} downloads/day, "
+          f"{args.enrollments_per_day:,.0f} enrollments/day")
+    print(f"servers     : {', '.join(SERVERS[s]['label'] for s in selected)} "
+          f"(timed and totalled separately)")
     print('fixtures valid ✓  (all signature / proof checks pass)')
-    print()
 
-    # per-op table
-    groups = [
-        ('SM-DP+  ZK additions per download (osmo-smdpp.py authenticateClient)', 'smdp_zk'),
-        ('MNO     ZK work per download (mno-server.py zkRequest)', 'mno_dl'),
-        ('Baseline SGP.22 transport crypto (both ZK and non-ZK)', 'base'),
-        ('Enrollment (one-time per device): MNO register + PCA certInit', 'enroll'),
-    ]
-    print(f"{'operation':<34}{'mean':>12}{'median':>12}{'p95':>12}{'ops/s':>10}")
-    print('-' * 78)
-    for title, g in groups:
-        print(f'• {title}')
-        for name, st in results.items():
-            if st['group'] != g:
-                continue
-            print(f"  {name:<32}{fmt_ns(st['mean_ns']):>12}{fmt_ns(st['median_ns']):>12}"
-                  f"{fmt_ns(st['p95_ns']):>12}{st['ops_per_sec']:>10,.0f}")
-    print('-' * 78)
+    # --- one section per server -------------------------------------------
+    for idx, server in enumerate([s for s in SERVER_ORDER if s in per_server], start=1):
+        print_server_section(idx, len(per_server), server,
+                             per_server[server], results, args)
 
-    # scenarios
-    print('\nCOMPOSED PER-DOWNLOAD COST (sum of component means)')
-    print('-' * 78)
-    labels = {
-        'baseline_download_smdp':          'Baseline download (SM-DP+ crypto only)',
-        'zk_smdp_addon_gross':             'ZK add-on on SM-DP+ (gross)',
-        'zk_smdp_addon_net_of_chainwalk':  'ZK add-on on SM-DP+ (net; ZK skips chain walk)',
-        'mno_accumulator_per_download_oN': '  of which MNO accumulator work (O(N))',
-        'zk_mno_per_download':             'ZK work on MNO per download (pure-Python Schnorr)',
-        'zk_per_download_total_all_roles': 'ZK ADDITIONAL per download (pure-Python upper bound)',
-        'zk_per_download_total_hazmat':    'ZK ADDITIONAL per download (OpenSSL/hazmat Schnorr)',
-        'zk_per_enrollment_one_time':      'ZK enrollment per device (one-time)',
-    }
-    for key, lab in labels.items():
-        sec = scenarios[key]
-        print(f"  {lab:<54}{fmt_ns(sec * 1e9):>14}")
-    print('-' * 78)
+    if len(per_server) > 1:
+        print_summary_table(per_server, args)
 
-    # extrapolation for the headline figures
-    print('\nHEADLINE: additional zkesim server cost at scale')
+    print('\nNOTES')
     print('-' * 78)
-    for key, lab in (
-            ('zk_per_download_total_hazmat',    'All ZK roles, OpenSSL/hazmat Schnorr (realistic)'),
-            ('zk_per_download_total_all_roles', 'All ZK roles, pure-Python Schnorr (upper bound)'),
-            ('zk_smdp_addon_net_of_chainwalk',  'Marginal cost on the download server (SM-DP+) only')):
-        sec = scenarios[key]
-        if sec <= 0:
-            continue
-        print(f'  {lab}:')
-        print(f'      per download      : {fmt_per_n(sec, 1)}')
-        print(f'      per 1,000         : {fmt_per_n(sec, 1_000)}')
-        print(f'      per 1,000,000     : {fmt_per_n(sec, 1_000_000)}')
-        print(f'      single-core rate  : {1.0 / sec:,.0f} downloads/sec/core')
-        per_day_core = 86_400.0 / sec
-        print(f'                          ≈ {per_day_core:,.0f} downloads/day/core')
-        cores = args.downloads_per_day * sec / 86_400.0
-        print(f'      to sustain {args.downloads_per_day:,.0f}/day: '
-              f'{cores:.3g} CPU-core(s) ({math.ceil(cores)} core(s) rounded up)')
-        print()
-
-    print('NOTES')
-    print('-' * 78)
+    print('* Each server is timed on its own: the SM-DP+, MNO and PCA totals are never')
+    print('  summed, because they run as separate processes and are provisioned')
+    print('  independently.  A single download touches all three, so their per-download')
+    print('  figures are concurrent costs on three different hosts, not one serial')
+    print('  latency budget.')
+    print('* The PCA is a per-DOWNLOAD cost, not a one-time enrollment cost: CertInit')
+    print('  runs before every download and mints a fresh PCert_U over a freshly')
+    print('  derived sk_U.  That is what makes successive downloads unlinkable, so the')
+    print('  pseudonym cert cannot be amortised across downloads.  Only the MNO Phase 0')
+    print('  registerCredential is one-time per device.')
     print('* mno.schnorr_verify is the prototype PURE-PYTHON P-256 verifier (zk_utils),')
     print('  shown as a conservative upper bound.  mno.schnorr_verify_hazmat is a')
     print('  drop-in verifier that delegates both scalar multiplications to OpenSSL')
