@@ -16,3 +16,4 @@ packaging
 git+https://github.com/hologram-io/smpp.pdu
 smpp.twisted3 @ git+https://github.com/jookies/smpp.twisted
 smpplib
+psutil
